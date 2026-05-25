@@ -114,6 +114,7 @@ def main() -> int:
                 local_files_only=bool(model_cfg.get("local_files_only", False)),
                 diffusers_src=diffusers_src,
                 local_paths=local_paths,
+                prefer_component_paths=bool(model_cfg.get("prefer_component_paths", False)),
             )
             report["model_load"].update({"ok": True, "report": load_report})
         except Exception as exc:

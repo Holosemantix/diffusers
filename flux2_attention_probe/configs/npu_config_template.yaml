@@ -1,7 +1,7 @@
 backend: npu
 diffusers_src: ../diffusers/src
 npu:
-  device_id: 2
+  device_id: 0
   model_name: 910B2
   total_memory_gb: 64
   cann_version: "25.5.1"
@@ -11,6 +11,7 @@ model:
   model_id: /home/ma-user/work/models/FLUX.2-klein-4B
   cache_dir: null
   local_files_only: true
+  prefer_component_paths: true
   dtype: bfloat16
   offload: false
   low_cpu_mem_usage: true

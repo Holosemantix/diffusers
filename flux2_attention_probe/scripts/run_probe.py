@@ -70,6 +70,7 @@ def run(args, cfg, output_dir: Path) -> int:
         local_files_only=bool(args.local_files_only or model_cfg.get("local_files_only", False)),
         diffusers_src=cfg.get("diffusers_src"),
         local_paths=local_paths,
+        prefer_component_paths=bool(model_cfg.get("prefer_component_paths", False)),
     )
     save_json(load_report, output_dir / "load_report.json")
 

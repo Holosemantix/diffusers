@@ -104,6 +104,20 @@ def list_pipeline_components(pipe: Any) -> dict[str, str]:
     return out
 
 
+def _model_dir_looks_complete(model_id: str) -> bool:
+    """A standard diffusers from_pretrained directory must have model_index.json at root."""
+    path = Path(model_id).expanduser()
+    if not path.is_dir():
+        return False
+    if not (path / "model_index.json").is_file():
+        return False
+    # transformer/ and scheduler/ subfolders are required for Flux2KleinPipeline.
+    for required in ("transformer", "scheduler"):
+        if not (path / required).is_dir():
+            return False
+    return True
+
+
 def load_flux2_pipeline(
     model_id: str = DEFAULT_MODEL_ID,
     cache_dir: str | None = None,
@@ -115,6 +129,7 @@ def load_flux2_pipeline(
     local_files_only: bool = False,
     diffusers_src: str | None = None,
     local_paths: dict[str, str] | None = None,
+    prefer_component_paths: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     backend = backend or BackendAdapter(device or "npu")
     report: dict[str, Any] = {"model_id": model_id, "warnings": []}
@@ -138,11 +153,30 @@ def load_flux2_pipeline(
 
     load_errors = []
     path_candidate = Path(model_id).expanduser()
-    try:
-        pipe = Flux2KleinPipeline.from_pretrained(str(path_candidate if path_candidate.exists() else model_id), **kwargs)
-    except Exception as exc:
-        load_errors.append(f"Flux2KleinPipeline.from_pretrained failed: {exc!r}")
+
+    # Skip the diffusers-format from_pretrained when the directory layout is not standard
+    # (e.g. flat single-file safetensors + tokenizer/text_encoder/vae subdirs without
+    # model_index.json), or when the caller explicitly forces the component-path path.
+    skip_from_pretrained = prefer_component_paths or (
+        path_candidate.is_dir() and not _model_dir_looks_complete(model_id)
+    )
+
+    if skip_from_pretrained:
+        load_errors.append(
+            "Skipping Flux2KleinPipeline.from_pretrained: "
+            + (
+                "prefer_component_paths=True"
+                if prefer_component_paths
+                else f"{model_id} is not a complete diffusers pipeline dir (missing model_index.json or transformer/scheduler)."
+            )
+        )
         pipe = _load_from_component_paths(Flux2KleinPipeline, local_paths or {}, torch_dtype, diffusers_src, load_errors)
+    else:
+        try:
+            pipe = Flux2KleinPipeline.from_pretrained(str(path_candidate if path_candidate.exists() else model_id), **kwargs)
+        except Exception as exc:
+            load_errors.append(f"Flux2KleinPipeline.from_pretrained failed: {exc!r}")
+            pipe = _load_from_component_paths(Flux2KleinPipeline, local_paths or {}, torch_dtype, diffusers_src, load_errors)
 
     if offload:
         enabled = _try_enable_offload(pipe, backend)
