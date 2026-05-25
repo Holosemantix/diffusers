@@ -4,6 +4,8 @@ the ChromaPipeline from Hugging Face Diffusers:contentReference[oaicite:0]{index
 approach:contentReference[oaicite:1]{index=1}.
 """
 
+from __future__ import annotations
+
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

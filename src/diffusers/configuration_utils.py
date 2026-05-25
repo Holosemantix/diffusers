@@ -15,6 +15,8 @@
 # limitations under the License.
 """ConfigMixin base class and utilities."""
 
+from __future__ import annotations
+
 import dataclasses
 import functools
 import importlib

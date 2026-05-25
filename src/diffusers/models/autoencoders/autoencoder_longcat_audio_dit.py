@@ -15,6 +15,8 @@
 # Adapted from the LongCat-AudioDiT reference implementation:
 # https://github.com/meituan-longcat/LongCat-AudioDiT
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 

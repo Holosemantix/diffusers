@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import inspect
 from itertools import repeat
 from typing import Callable

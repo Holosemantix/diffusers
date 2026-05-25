@@ -22,6 +22,8 @@ Reference implementation (ComfyUI):
     comfy.k_diffusion.sampling.sample_euler_ancestral_RF
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch

@@ -16,6 +16,8 @@
 Text and VAE encoder blocks for QwenImage pipelines.
 """
 
+from __future__ import annotations
+
 import PIL
 import torch
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor

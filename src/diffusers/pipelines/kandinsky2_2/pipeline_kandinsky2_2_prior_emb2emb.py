@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import PIL.Image
 import torch
 from transformers import CLIPImageProcessor, CLIPTextModelWithProjection, CLIPTokenizer, CLIPVisionModelWithProjection

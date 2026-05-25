@@ -14,6 +14,8 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/yang-song/score_sde_pytorch
 
+from __future__ import annotations
+
 import math
 
 import torch

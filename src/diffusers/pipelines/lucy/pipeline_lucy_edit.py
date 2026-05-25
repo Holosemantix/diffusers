@@ -16,6 +16,8 @@
 # Modifications by Decart AI Team:
 # - Based on pipeline_wan.py, but with supports receiving a condition video appended to the channel dimension.
 
+from __future__ import annotations
+
 import html
 from typing import Any, Callable
 

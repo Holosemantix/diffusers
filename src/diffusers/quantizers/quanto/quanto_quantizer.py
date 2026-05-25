@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any
 
 from diffusers.utils.import_utils import is_optimum_quanto_version

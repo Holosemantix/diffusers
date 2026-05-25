@@ -16,6 +16,8 @@
 # More information and citation instructions are available on the
 # Marigold project website: https://marigoldcomputervision.github.io
 # --------------------------------------------------------------------------
+from __future__ import annotations
+
 from typing import Any
 
 import numpy as np

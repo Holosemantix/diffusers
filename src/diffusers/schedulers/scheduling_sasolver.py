@@ -15,6 +15,8 @@
 # DISCLAIMER: check https://huggingface.co/papers/2309.05019
 # The codebase is modified based on https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_dpmsolver_multistep.py
 
+from __future__ import annotations
+
 import math
 from typing import Callable, Literal
 

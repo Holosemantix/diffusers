@@ -16,6 +16,8 @@
 # DISCLAIMER: This code is strongly influenced by https://github.com/pesser/pytorch_diffusion
 # and https://github.com/hojonathanho/diffusion
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import Literal

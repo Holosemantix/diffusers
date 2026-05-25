@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 import warnings
+from typing import List, Union
 
 import numpy as np
 import PIL.Image
@@ -25,9 +28,14 @@ from .configuration_utils import ConfigMixin, register_to_config
 from .utils import CONFIG_NAME, PIL_INTERPOLATION, deprecate
 
 
-PipelineImageInput = (
-    PIL.Image.Image | np.ndarray | torch.Tensor | list[PIL.Image.Image] | list[np.ndarray] | list[torch.Tensor]
-)
+PipelineImageInput = Union[
+    PIL.Image.Image,
+    np.ndarray,
+    torch.Tensor,
+    List[PIL.Image.Image],
+    List[np.ndarray],
+    List[torch.Tensor],
+]
 
 PipelineDepthInput = PipelineImageInput
 

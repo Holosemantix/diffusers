@@ -16,6 +16,8 @@ Adapted from
 https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/integrations/bitsandbytes.py
 """
 
+from __future__ import annotations
+
 import inspect
 from inspect import signature
 

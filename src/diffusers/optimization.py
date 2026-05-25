@@ -14,6 +14,8 @@
 # limitations under the License.
 """PyTorch optimization for diffusion models."""
 
+from __future__ import annotations
+
 import math
 from enum import Enum
 

@@ -8,6 +8,8 @@
 #
 # See the license for further details.
 
+from __future__ import annotations
+
 from typing import Any, Callable
 
 import numpy as np

@@ -14,6 +14,8 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/LuChengTHU/dpm-solver
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import flax

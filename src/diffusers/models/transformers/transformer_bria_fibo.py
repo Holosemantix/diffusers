@@ -7,6 +7,8 @@
 # indicate if changes were made, and do not use the material for commercial purposes.
 #
 # See the license for further details.
+from __future__ import annotations
+
 import inspect
 from typing import Any
 

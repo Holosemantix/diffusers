@@ -17,6 +17,8 @@ Adapted from
 https://github.com/huggingface/transformers/blob/3a8eb74668e9c2cc563b2f5c62fac174797063e0/src/transformers/quantizers/quantizer_torchao.py
 """
 
+from __future__ import annotations
+
 import importlib
 import re
 import types

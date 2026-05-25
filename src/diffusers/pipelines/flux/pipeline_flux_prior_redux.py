@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import torch
 from PIL import Image
 from transformers import (

@@ -14,6 +14,8 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/LuChengTHU/dpm-solver and https://github.com/NVlabs/edm
 
+from __future__ import annotations
+
 import math
 from typing import Literal
 

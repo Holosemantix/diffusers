@@ -1,6 +1,8 @@
 # Copyright 2025 ZenAI. All rights reserved.
 # author: @vuongminh1907
 
+from __future__ import annotations
+
 import inspect
 from typing import Any, Callable
 

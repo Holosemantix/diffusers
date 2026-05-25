@@ -18,6 +18,8 @@
 # - GitHub: https://github.com/Wan-Video/Wan2.1
 # - Paper: https://huggingface.co/papers/2503.20314
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

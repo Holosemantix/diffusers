@@ -14,6 +14,8 @@
 #
 # Adapted from diffusers.pipelines.wan.pipeline_wan.WanPipeline (v0.35.1) for FAR causal flow-map sampling.
 
+from __future__ import annotations
+
 import copy
 import html
 from typing import Any, Callable, Dict, List, Optional, Union

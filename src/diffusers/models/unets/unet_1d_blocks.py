@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import math
+from typing import Union
 
 import torch
 import torch.nn.functional as F
@@ -616,10 +619,10 @@ class UpBlock1DNoSkip(nn.Module):
         return hidden_states
 
 
-DownBlockType = DownResnetBlock1D | DownBlock1D | AttnDownBlock1D | DownBlock1DNoSkip
-MidBlockType = MidResTemporalBlock1D | ValueFunctionMidBlock1D | UNetMidBlock1D
-OutBlockType = OutConv1DBlock | OutValueFunctionBlock
-UpBlockType = UpResnetBlock1D | UpBlock1D | AttnUpBlock1D | UpBlock1DNoSkip
+DownBlockType = Union[DownResnetBlock1D, DownBlock1D, AttnDownBlock1D, DownBlock1DNoSkip]
+MidBlockType = Union[MidResTemporalBlock1D, ValueFunctionMidBlock1D, UNetMidBlock1D]
+OutBlockType = Union[OutConv1DBlock, OutValueFunctionBlock]
+UpBlockType = Union[UpResnetBlock1D, UpBlock1D, AttnUpBlock1D, UpBlock1DNoSkip]
 
 
 def get_down_block(

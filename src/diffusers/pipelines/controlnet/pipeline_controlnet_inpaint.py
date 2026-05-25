@@ -14,6 +14,8 @@
 
 # This model implementation is heavily inspired by https://github.com/haofanwang/ControlNet-for-Diffusers/
 
+from __future__ import annotations
+
 import inspect
 from typing import Any, Callable
 

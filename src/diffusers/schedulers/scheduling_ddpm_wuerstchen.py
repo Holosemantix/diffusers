@@ -15,6 +15,8 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/ermongroup/ddim
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 
