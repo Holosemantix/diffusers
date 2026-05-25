@@ -28,6 +28,51 @@ try:
 except Exception:
     pass
 
+# torch 2.1 compat: ``torch.nn.RMSNorm`` was added in torch 2.4. FLUX.2 Klein's
+# transformer uses it directly; provide a pure-PyTorch equivalent when missing so
+# the module can be constructed on torch 2.1.
+try:
+    import torch as _diffusers_torch_compat
+    import torch.nn as _diffusers_nn_compat
+
+    if not hasattr(_diffusers_nn_compat, "RMSNorm"):
+
+        class _DiffusersRMSNorm(_diffusers_nn_compat.Module):
+            def __init__(self, normalized_shape, eps=None, elementwise_affine=True, device=None, dtype=None):
+                super().__init__()
+                if isinstance(normalized_shape, int):
+                    normalized_shape = (normalized_shape,)
+                self.normalized_shape = tuple(int(d) for d in normalized_shape)
+                self.eps = 1e-6 if eps is None else float(eps)
+                self.elementwise_affine = bool(elementwise_affine)
+                if self.elementwise_affine:
+                    self.weight = _diffusers_nn_compat.Parameter(
+                        _diffusers_torch_compat.ones(self.normalized_shape, device=device, dtype=dtype)
+                    )
+                else:
+                    self.register_parameter("weight", None)
+
+            def forward(self, hidden_states):
+                input_dtype = hidden_states.dtype
+                dims = tuple(range(-len(self.normalized_shape), 0))
+                variance = hidden_states.to(_diffusers_torch_compat.float32).pow(2).mean(dim=dims, keepdim=True)
+                hidden_states = (hidden_states.to(_diffusers_torch_compat.float32) *
+                                 _diffusers_torch_compat.rsqrt(variance + self.eps)).to(input_dtype)
+                if self.weight is not None:
+                    hidden_states = hidden_states * self.weight
+                return hidden_states
+
+            def extra_repr(self):
+                return (
+                    f"{self.normalized_shape}, eps={self.eps}, "
+                    f"elementwise_affine={self.elementwise_affine}"
+                )
+
+        _diffusers_nn_compat.RMSNorm = _DiffusersRMSNorm
+    del _diffusers_torch_compat, _diffusers_nn_compat
+except Exception:
+    pass
+
 from typing import TYPE_CHECKING
 
 from .utils import (
