@@ -32,12 +32,17 @@ except Exception:
 # transformer uses it directly; provide a pure-PyTorch equivalent when missing so
 # the module can be constructed on torch 2.1.
 try:
-    import torch as _diffusers_torch_compat
-    import torch.nn as _diffusers_nn_compat
+    import torch as _torch
+    import torch.nn as _nn
 
-    if not hasattr(_diffusers_nn_compat, "RMSNorm"):
+    if not hasattr(_nn, "RMSNorm"):
 
-        class _DiffusersRMSNorm(_diffusers_nn_compat.Module):
+        class _DiffusersRMSNorm(_nn.Module):
+            # Capture torch / nn as class attributes so methods do not depend on
+            # module-globals (which may be deleted or shadowed downstream).
+            _t = _torch
+            _n = _nn
+
             def __init__(self, normalized_shape, eps=None, elementwise_affine=True, device=None, dtype=None):
                 super().__init__()
                 if isinstance(normalized_shape, int):
@@ -46,21 +51,22 @@ try:
                 self.eps = 1e-6 if eps is None else float(eps)
                 self.elementwise_affine = bool(elementwise_affine)
                 if self.elementwise_affine:
-                    self.weight = _diffusers_nn_compat.Parameter(
-                        _diffusers_torch_compat.ones(self.normalized_shape, device=device, dtype=dtype)
+                    self.weight = self._n.Parameter(
+                        self._t.ones(self.normalized_shape, device=device, dtype=dtype)
                     )
                 else:
                     self.register_parameter("weight", None)
 
             def forward(self, hidden_states):
+                t = self._t
                 input_dtype = hidden_states.dtype
                 dims = tuple(range(-len(self.normalized_shape), 0))
-                variance = hidden_states.to(_diffusers_torch_compat.float32).pow(2).mean(dim=dims, keepdim=True)
-                hidden_states = (hidden_states.to(_diffusers_torch_compat.float32) *
-                                 _diffusers_torch_compat.rsqrt(variance + self.eps)).to(input_dtype)
+                x = hidden_states.to(t.float32)
+                variance = x.pow(2).mean(dim=dims, keepdim=True)
+                x = (x * t.rsqrt(variance + self.eps)).to(input_dtype)
                 if self.weight is not None:
-                    hidden_states = hidden_states * self.weight
-                return hidden_states
+                    x = x * self.weight
+                return x
 
             def extra_repr(self):
                 return (
@@ -68,8 +74,8 @@ try:
                     f"elementwise_affine={self.elementwise_affine}"
                 )
 
-        _diffusers_nn_compat.RMSNorm = _DiffusersRMSNorm
-    del _diffusers_torch_compat, _diffusers_nn_compat
+        _nn.RMSNorm = _DiffusersRMSNorm
+    del _torch, _nn
 except Exception:
     pass
 
