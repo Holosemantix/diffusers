@@ -15,6 +15,8 @@
 Import utilities: Utilities related to imports and our lazy inits.
 """
 
+from __future__ import annotations
+
 import importlib.util
 import inspect
 import operator as op

@@ -15,6 +15,8 @@
 Typing utilities: Utilities related to type checking and validation
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, List, Set, Tuple, Type, Union, get_args, get_origin
 
 

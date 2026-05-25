@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # coding=utf-8
 # Copyright 2025 The HuggingFace Inc. team.
 #
