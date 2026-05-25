@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import Callable, ParamSpec, TypeVar
+from typing import Callable, TypeVar
+
+from typing_extensions import ParamSpec
 
 from . import logging
 from .import_utils import is_torch_available, is_torch_mlu_available, is_torch_npu_available, is_torch_version
@@ -33,52 +35,54 @@ if is_torch_available():
     import torch
     from torch.fft import fftn, fftshift, ifftn, ifftshift
 
+    _torch_xpu = getattr(torch, "xpu", None)
+
     BACKEND_SUPPORTS_TRAINING = {"cuda": True, "xpu": True, "cpu": True, "mps": False, "default": True}
     BACKEND_EMPTY_CACHE = {
         "cuda": torch.cuda.empty_cache,
-        "xpu": torch.xpu.empty_cache,
+        "xpu": getattr(_torch_xpu, "empty_cache", None),
         "cpu": None,
         "mps": torch.mps.empty_cache,
         "default": None,
     }
     BACKEND_DEVICE_COUNT = {
         "cuda": torch.cuda.device_count,
-        "xpu": torch.xpu.device_count,
+        "xpu": getattr(_torch_xpu, "device_count", lambda: 0),
         "cpu": lambda: 0,
         "mps": lambda: 0,
         "default": 0,
     }
     BACKEND_MANUAL_SEED = {
         "cuda": torch.cuda.manual_seed,
-        "xpu": torch.xpu.manual_seed,
+        "xpu": getattr(_torch_xpu, "manual_seed", None),
         "cpu": torch.manual_seed,
         "mps": torch.mps.manual_seed,
         "default": torch.manual_seed,
     }
     BACKEND_RESET_PEAK_MEMORY_STATS = {
         "cuda": torch.cuda.reset_peak_memory_stats,
-        "xpu": getattr(torch.xpu, "reset_peak_memory_stats", None),
+        "xpu": getattr(_torch_xpu, "reset_peak_memory_stats", None),
         "cpu": None,
         "mps": None,
         "default": None,
     }
     BACKEND_RESET_MAX_MEMORY_ALLOCATED = {
         "cuda": torch.cuda.reset_max_memory_allocated,
-        "xpu": getattr(torch.xpu, "reset_peak_memory_stats", None),
+        "xpu": getattr(_torch_xpu, "reset_peak_memory_stats", None),
         "cpu": None,
         "mps": None,
         "default": None,
     }
     BACKEND_MAX_MEMORY_ALLOCATED = {
         "cuda": torch.cuda.max_memory_allocated,
-        "xpu": getattr(torch.xpu, "max_memory_allocated", None),
+        "xpu": getattr(_torch_xpu, "max_memory_allocated", None),
         "cpu": 0,
         "mps": 0,
         "default": 0,
     }
     BACKEND_SYNCHRONIZE = {
         "cuda": torch.cuda.synchronize,
-        "xpu": getattr(torch.xpu, "synchronize", None),
+        "xpu": getattr(_torch_xpu, "synchronize", None),
         "cpu": None,
         "mps": None,
         "default": None,
