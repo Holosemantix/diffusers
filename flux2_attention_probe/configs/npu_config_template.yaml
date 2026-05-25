@@ -1,0 +1,37 @@
+backend: npu
+diffusers_src: ../diffusers/src
+npu:
+  device_id: 2
+  model_name: 910B2
+  total_memory_gb: 64
+  cann_version: "25.5.1"
+  torch_npu_version: "2.1.0.post8.dev20241029"
+  precision_preference: bf16
+model:
+  model_id: /home/ma-user/work/models/FLUX.2-klein-4B
+  cache_dir: null
+  local_files_only: true
+  dtype: bfloat16
+  offload: false
+  low_cpu_mem_usage: true
+local_paths:
+  flux2_tokenizer_path: /home/ma-user/work/models/FLUX.2-klein-4B/tokenizer
+  flux2_model_path: /home/ma-user/work/models/FLUX.2-klein-4B/flux-2-klein-4b.safetensors
+  flux2_text_encoder_path: /home/ma-user/work/models/FLUX.2-klein-4B/text_encoder
+  flux2_ae_path: /home/ma-user/work/models/FLUX.2-klein-4B/vae/diffusion_pytorch_model.safetensors
+probe:
+  save_full_attention: false
+  save_block_attention: true
+  block_size: 32
+  sample_layers: [0, 4, 8, 12, 16, 20]
+  sample_heads: all
+  sample_steps: [0, 1, 2, 3]
+  stream_to_disk: true
+  max_query_tokens_per_record: 2048
+generation:
+  height: 1024
+  width: 1024
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  seed: 0
+
