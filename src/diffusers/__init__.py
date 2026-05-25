@@ -1,5 +1,33 @@
 __version__ = "0.39.0.dev0"
 
+# torch 2.1 compat: transformers >= 4.46 calls the public
+# ``torch.utils._pytree.register_pytree_node``, which only exists on torch >= 2.2
+# and accepts extra kwargs (``serialized_type_name``, ``flatten_with_keys_fn``, ...).
+# Provide a wrapper that drops unknown kwargs and delegates to the private API
+# shipped with torch 2.1 so importing transformers does not blow up.
+try:
+    import torch.utils._pytree as _diffusers_pytree_compat
+
+    if not hasattr(_diffusers_pytree_compat, "register_pytree_node") and hasattr(
+        _diffusers_pytree_compat, "_register_pytree_node"
+    ):
+        _diffusers_orig_register = _diffusers_pytree_compat._register_pytree_node
+
+        def _diffusers_register_pytree_node(cls, flatten_fn, unflatten_fn, *args, **kwargs):
+            for _drop in (
+                "serialized_type_name",
+                "flatten_with_keys_fn",
+                "to_dumpable_context",
+                "from_dumpable_context",
+            ):
+                kwargs.pop(_drop, None)
+            return _diffusers_orig_register(cls, flatten_fn, unflatten_fn, *args, **kwargs)
+
+        _diffusers_pytree_compat.register_pytree_node = _diffusers_register_pytree_node
+    del _diffusers_pytree_compat
+except Exception:
+    pass
+
 from typing import TYPE_CHECKING
 
 from .utils import (
