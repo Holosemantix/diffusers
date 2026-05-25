@@ -19,7 +19,7 @@ model:
   model_id: /home/ma-user/work/models/FLUX.2-klein-4B
   cache_dir: null
   local_files_only: true
-  prefer_component_paths: true
+  prefer_component_paths: false
   dtype: bfloat16
   offload: false
   low_cpu_mem_usage: true
