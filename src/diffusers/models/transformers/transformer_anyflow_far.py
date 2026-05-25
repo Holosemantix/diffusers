@@ -25,7 +25,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+except (ImportError, ModuleNotFoundError):
+    # torch < 2.5 has no `torch.nn.attention.flex_attention`. AnyFlow FAR will fail
+    # loudly if invoked, but other pipelines (e.g. FLUX.2) can still import.
+    def create_block_mask(*args, **kwargs):  # type: ignore[no-redef]
+        raise ImportError(
+            "AnyFlowFARTransformer3DModel requires torch>=2.5 for "
+            "torch.nn.attention.flex_attention.create_block_mask; this torch build "
+            "does not provide it."
+        )
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
