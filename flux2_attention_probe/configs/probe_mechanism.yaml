@@ -1,0 +1,62 @@
+# FLUX.2 Klein full layer / head / step mechanism probe — single source + single ref.
+#
+# Goal: cover X→{S, R1, P} flows across the full denoising trajectory by
+# sampling all 5 double blocks + 4 evenly spaced single blocks, all 24 heads,
+# and 5 timesteps spread across 28 steps. The key knob is
+# ``max_query_tokens_per_record: all`` which removes the q-truncation that
+# limited the smoke run to the prompt (P) segment.
+#
+# Expected cost on Ascend 910B2 (64 GB HBM), 912x1136, 28 steps:
+#   - probe overhead ~ 12-18 min on top of pipeline forward
+#   - peak HBM     ~ 22-26 GB (smoke baseline was 17.8 GB)
+#   - attention_blocks.jsonl ~ 150-250 MB
+# Scale down by trimming sample_layers/heads/steps if needed.
+
+backend: npu
+diffusers_src: ../diffusers/src
+output_dir: outputs/mechanism_single_ref
+
+# Pass source / refs / prompt via CLI (--source / --refs / --prompt).
+# Reusing the smoke pair is the simplest path:
+#   --source $REF1 --refs $REF2
+source: null
+refs: []
+prompt: ""
+
+reference_roles:
+  R1: edit_attribute
+region_annotations: {}
+
+model:
+  model_id: /home/ma-user/work/models/FLUX.2-klein-4B
+  cache_dir: null
+  local_files_only: true
+  prefer_component_paths: false
+  dtype: bfloat16
+  offload: false
+  low_cpu_mem_usage: true
+
+local_paths:
+  flux2_tokenizer_path: /home/ma-user/work/models/FLUX.2-klein-4B/tokenizer
+  flux2_model_path: /home/ma-user/work/models/FLUX.2-klein-4B/flux-2-klein-4b.safetensors
+  flux2_text_encoder_path: /home/ma-user/work/models/FLUX.2-klein-4B/text_encoder
+  flux2_ae_path: /home/ma-user/work/models/FLUX.2-klein-4B/vae/diffusion_pytorch_model.safetensors
+
+probe:
+  save_full_attention: false
+  save_block_attention: true
+  block_size: 128                                  # 99 q-blocks × 99 k-blocks; balances detail vs. disk
+  sample_layers: [0, 1, 2, 3, 4, 9, 14, 19, 24]   # 5 double + 4 single (every ~5 layers)
+  sample_heads: all                                # all 24 heads — needed for head specialization
+  sample_steps: [0, 7, 14, 21, 27]                # early/mid/late of 28
+  stream_to_disk: true
+  max_query_tokens_per_record: all                 # cover all [P, X, S, R1] queries after auto-fit
+  record_shapes: true
+
+generation:
+  height: null
+  width: null
+  max_size: 1024
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  seed: 0
