@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import shutil
 import sys
 import time
@@ -28,8 +29,13 @@ def parse_args():
     parser.add_argument("--source", default=None)
     parser.add_argument("--refs", nargs="*", default=None)
     parser.add_argument("--prompt", default=None)
-    parser.add_argument("--height", type=int, default=None)
-    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None,
+                        help="Output height. If both height and width are unset, auto-fit using --max_size.")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Output width. If both height and width are unset, auto-fit using --max_size.")
+    parser.add_argument("--max_size", type=int, default=None,
+                        help="Target side length when auto-fitting; effective area = max_size**2 "
+                             "(matches Flux2KleinPipeline's internal 1024 default).")
     parser.add_argument("--num_inference_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--backend", default=None)
@@ -85,8 +91,9 @@ def run(args, cfg, output_dir: Path) -> int:
     refs = args.refs if args.refs is not None else cfg.get("refs", [])
     prompt = args.prompt or cfg.get("prompt") or ""
     gen_cfg = cfg.get("generation", {})
-    height = args.height or gen_cfg.get("height", 512)
-    width = args.width or gen_cfg.get("width", 512)
+    height = args.height or gen_cfg.get("height")
+    width = args.width or gen_cfg.get("width")
+    max_size = args.max_size or gen_cfg.get("max_size") or 1024
     steps = args.num_inference_steps or gen_cfg.get("num_inference_steps", 1)
     guidance_scale = gen_cfg.get("guidance_scale", 1.0)
     seed = args.seed if args.seed is not None else gen_cfg.get("seed", 0)
@@ -94,6 +101,9 @@ def run(args, cfg, output_dir: Path) -> int:
     images = load_condition_images(source, refs)
     if images:
         make_input_grid(images, output_dir / "input_grid.png", labels=(["S"] if source else []) + [f"R{i+1}" for i in range(len(refs))])
+
+    height, width, size_decision = resolve_output_size(pipe, images, height, width, max_size)
+    save_json(size_decision, output_dir / "effective_run.json")
 
     backend.reset_peak_memory_stats()
     generator = backend.manual_seed(int(seed))
@@ -158,6 +168,66 @@ def load_condition_images(source, refs):
         img = Image.open(path).convert("RGB")
         images.append(img)
     return images
+
+
+def resolve_output_size(pipe, images, height, width, max_size):
+    """Mirror Flux2KleinPipeline's input-image-driven sizing.
+
+    - When the caller fixed both height and width, honor them.
+    - When at least one condition image exists and either dim is unset, scale the first
+      image's (W, H) so W*H approaches max_size**2 (only down, never up), preserving
+      aspect ratio, then floor each dim to ``vae_scale_factor * 2``.
+    - When no condition image exists, fall back to a square ``max_size`` (matched to the
+      pipeline's ``default_sample_size * vae_scale_factor`` behavior when callers leave
+      sizes unset).
+    """
+    vae_scale_factor = int(getattr(pipe, "vae_scale_factor", 8))
+    multiple_of = vae_scale_factor * 2
+    target_area = int(max_size) * int(max_size)
+
+    decision = {
+        "max_size": int(max_size),
+        "target_area": target_area,
+        "multiple_of": multiple_of,
+        "vae_scale_factor": vae_scale_factor,
+        "first_image_size": None,
+        "scale": None,
+        "rule": None,
+        "height_in": height,
+        "width_in": width,
+    }
+
+    if height and width:
+        decision["rule"] = "explicit"
+        return int(height), int(width), {**decision, "height_out": int(height), "width_out": int(width)}
+
+    if images:
+        ref = images[0]
+        in_w, in_h = ref.size
+        decision["first_image_size"] = [in_w, in_h]
+        pixel_count = in_w * in_h
+        if pixel_count > target_area:
+            scale = math.sqrt(target_area / pixel_count)
+            new_w = int(in_w * scale)
+            new_h = int(in_h * scale)
+            decision["scale"] = scale
+            decision["rule"] = "scale_down_to_max_size"
+        else:
+            new_w, new_h = in_w, in_h
+            decision["scale"] = 1.0
+            decision["rule"] = "below_max_size_keep_native"
+        new_w = max(multiple_of, (new_w // multiple_of) * multiple_of)
+        new_h = max(multiple_of, (new_h // multiple_of) * multiple_of)
+        height_out = int(height) if height else new_h
+        width_out = int(width) if width else new_w
+    else:
+        decision["rule"] = "no_image_fallback_square"
+        height_out = int(height) if height else int(max_size)
+        width_out = int(width) if width else int(max_size)
+
+    decision["height_out"] = height_out
+    decision["width_out"] = width_out
+    return height_out, width_out, decision
 
 
 if __name__ == "__main__":

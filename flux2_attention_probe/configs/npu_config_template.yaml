@@ -30,8 +30,9 @@ probe:
   stream_to_disk: true
   max_query_tokens_per_record: 2048
 generation:
-  height: 1024
-  width: 1024
+  height: null
+  width: null
+  max_size: 1024
   num_inference_steps: 4
   guidance_scale: 1.0
   seed: 0
