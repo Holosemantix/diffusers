@@ -1,226 +1,408 @@
-# FLUX.2 Klein 推理机制 — Smoke 全面分析
+# FLUX.2 Klein 单 Source + 单 Ref 推理机制分析
 
-> 数据来源：`outputs/smoke_background/`（实际目录 `/home/ma-user/work/algorithm/algorithm_lyr/results/smoke_background`）
-> 配置：`configs/probe_single_ref.yaml`（被 `--num_inference_steps 28` 覆盖到 28 步），source + 1 ref，512² 不到的 max_size 上限。
-
-本文档把这次 smoke 跑出的"功能性证据"和"机制性证据"分开梳理，并给出下一步的实验路径。
+> 数据来源：
+> - smoke: `/home/ma-user/work/algorithm/algorithm_lyr/results/smoke_background`
+> - mechanism light: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light`
+>
+> 任务：source + 1 reference，prompt 为 `Change the background of the first image to that of the second image.`
+>
+> 目标：先在 full attention teacher 下研究 FLUX.2-klein-4B 如何使用 noisy target、source image、reference image 和 prompt tokens。当前不是训练，不做 sparse attention，也不先做多参考消融。
 
 ---
 
-## 1. 执行摘要
+## 1. 结论摘要
 
-| 项 | 结果 | 证据 |
+| 问题 | 当前结论 | 证据 |
 |---|---|---|
-| Pipeline 加载 | ✅ 干净，五件 components 全在 | `load_report.json` `load_errors: []` `warnings: []` |
-| Auto-fit 尺寸 | ✅ 2571×2048 → 912×1136 (≤ 1024²)，floor 到 16 正确 | `effective_run.json` `rule=scale_down_to_max_size, scale=0.446` |
-| 28 step × 24 head × 25 layer 全程稳定 | ✅ 无 OOM、无 NaN/Inf、无中断 | `timing_report.json` `elapsed=68.5s`，`memory_report.json` `peak=17.8GB / 64GB` |
-| Probe 钩子挂载 | ✅ 25 个 attention module 全替换 | `probe_registration.json` `num_attention_modules=25` |
-| Token 分段自动推断 | ✅ `[P, X, S, R1]` 四段，token 计数对得上几何 | `segment_map.json` |
-| 块级 attention 落盘 | ✅ 2 条 record，softmax 总和 ≈1，结构正确 | `attention_blocks.jsonl` 首条 |
+| pipeline / NPU / hook 是否打通 | 已打通 | `load_errors=[]`，25 个 attention module 注册，`attention_blocks.jsonl` 生成 |
+| token 分段是否可靠 | 可靠 | 自动推断 `[P, X, S, R1]`，总长 12621 |
+| target 是否直接读取 reference | 是，但高度集中在少数 layer/head | 全局 `X->R1=0.093`，但最高 head 到 `0.828` |
+| source preservation 是否存在 | 是，主要表现为高 `X->X` 与部分 early `X->S` head | 全局 `X->X=0.684`，`X->S=0.076`；step0 layer4 head4 `X->S=0.488` |
+| prompt 是否全程重要 | 是，且 single-stream 中后层很强 | 全局 `X->P=0.190`；layer14 `X->P=0.337`，layer24 `X->P=0.291` |
+| source/ref 是否直接融合 | 是，尤其最后 single block | 全局 `S->R1=0.116`、`R1->S=0.101`；layer24 分别 `0.178/0.178` |
+| attention 是否天然稀疏 | 是，head/layer 差异明显 | token normalized entropy 均值 `0.540`，最低 `0.200`；Gini 均值 `0.835` |
+| 多参考 reference-reference | 当前不能回答 | 只有 `R1`，还没有 `R1<->R2` |
+| low/high resolution 一致性 | 当前不能回答 | 只跑了 1024 max_size auto-fit |
+| ref ablation / hidden deviation | 当前不能回答 | 只做 diagnostic full-attention probe |
 
-**结论**：管线、probe、auto-fit、token 分段、attention 数据收集**全链路打通**。但当前 smoke 的采样窗口（`sample_layers=[0]`, `sample_heads=[0]`, `sample_steps=[0]`, `max_query_tokens_per_record=512`）**只能看到 prompt 端在最浅一层的行为**，看不到 README 真正想要的 `X→S / X→R / X→P` —— 需要扩窗才能下机制性结论。下面 §6 会给具体的扩窗参数。
+一句话结论：
 
----
-
-## 2. 架构发现：Klein-4B 是 5 + 20 双流/单流 DiT
-
-`probe_registration.json` 把 25 个 attention 模块按名字列了出来：
-
-```
-transformer_blocks.{0..4}.attn          ← 5 个 double-stream block
-single_transformer_blocks.{0..19}.attn  ← 20 个 single-stream block
-```
-
-这是 Black Forest Labs 的经典 Flux DiT 结构：
-
-- **前 5 层 double-stream**：text 流与 image 流并行走两套 Q/K/V 投影，再在 attention 内拼接做交叉。当前文件里 `attention_kind=Flux2Attention`，但 processor 实际走的是 `ProbedFlux2DoubleProcessor`（因为模块没有 `to_qkv_mlp_proj`）。
-- **后 20 层 single-stream**：text+image 已被 concat 成一条序列，每层一个统一的 Q/K/V，跑完整自注意力。这层的 processor 是 `ProbedFlux2ParallelProcessor`（有 `to_qkv_mlp_proj`，QKV 与 MLP 共投影矩阵，省一次 matmul）。
-- **总深度 25 层** —— 比 Flux.1 dev (19+38=57) 和 Flux.1 schnell (19+38=57) 都浅得多，所以 4B 的体量主要花在更宽的 hidden_dim 上而不是层数。
-
-**实测维度**：`query_shape = [1, 12621, 24, 128]`
-- `heads = 24`
-- `head_dim = 128`
-- `inner_dim = heads * head_dim = 3072`
-- 与 `hidden_states_shape = [1, 12109, 3072]` 一致 → **不是 GQA/MQA，K 头数 = Q 头数 = 24，KV cache 内存按全头数算**。
+> 在单 source + 单 ref 的 background-change 任务中，FLUX.2 Klein 并不是均匀地把 reference 注入 target。绝大多数 token 仍以自段注意为主，但少数 layer/head 承担很强的跨段路由：layer4/head4 和 layer14/head12 是最明显的 `X->R1` reference-transfer head，layer14/24 的若干 head 强烈保留 `X->P` prompt 约束，layer24 则出现明显 `S<->R1` 与 `S/R1->X` 融合/回写。
 
 ---
 
-## 3. Token 序列布局 —— 标准 `[P, X, S, R1]`
+## 2. 实验配置与运行稳定性
 
-`segment_map.json` 自动推断的结果（auto-fit 把 source 缩到 912×1136，把唯一 ref 缩到约 880×1168）：
+### 2.1 机制 light 配置
 
-| 段 | 范围 | 长度 | 物理意义 | 几何 |
-|---|---|---|---|---|
-| P  | [0, 512)       | 512   | Qwen3 prompt embedding | Qwen3 强制 512 tokens |
-| X  | [512, 4559)    | 4,047 | 目标加噪 latent | 912/16 × 1136/16 = 57 × 71 = 4047 patch |
-| S  | [4559, 8606)   | 4,047 | source 编码 token | 与 X 同尺寸（来自同一 source 缩放） |
-| R1 | [8606, 12621)  | 4,015 | reference 编码 token | 约 55 × 73 = 4015，ref 图独立 snap |
-| **总长** | | **12,621** | | = encoder(512) + image(12,109) |
+`probe_registration.json`：
 
-关键确认：
-- `hidden_states_shape = [1, 12109, 128]` ✓ (image-only 段)
-- `encoder_hidden_states_shape = [1, 512, 7680]` ✓ (text-only 段，7680 是 Qwen3 hidden_dim)
-- query/key/value `= [1, 12621, 24, 128]` ✓ (double-block 内部 concat 后)
-
-**`shape_log_tail` 显示 step 23–27 这 5 步 shape 完全一致** —— 说明从 prefill 到去噪每一步序列长度恒定，没有动态稀疏或截断。`token_segments.py` 推断 ranges 时的 source/manual 切换也没被触发（`metadata.source=auto`）。
-
-> 这条布局印证了 README 的约定：**`[P, X, S, R1, R2, ...]` 顺序固定，可以直接用 segment_map 切 attention 矩阵**。
-
----
-
-## 4. Attention 实测分布（layer 0 / head 0 / step 0）
-
-`attention_blocks.jsonl` 的首条记录（`module_name=transformer_blocks.0.attn`，最浅的 double block，第一步去噪）：
-
-```
-q_len = 512     ← 被 max_query_tokens_per_record=512 截了
-k_len = 12621
-block_size = 64 → 8 × 198 cell 的块矩阵
-mean_entropy = 8.10 nats
-normalized_entropy = 0.858    ← 接近均匀分布（uniform = 1）
-top16_block_mass = 1.67       ← 8 个 q-block 里的前 16 个 cell 共占 1.67/8 ≈ 21%
-segment_mass:
-  P→P  = 0.376    ← prompt 自己 self-attend
-  P→X  = 0.466    ← prompt 写入 noisy target
-  P→S  = 0.104    ← prompt 看 source
-  P→R1 = 0.056    ← prompt 看 reference
+```yaml
+save_full_attention: false
+save_block_attention: true
+block_size: 256
+sample_layers: [0, 4, 14, 24]
+sample_heads: [0, 4, 8, 12, 16, 20]
+sample_steps: [0, 14, 27]
+max_query_tokens_per_record: 12621
 ```
 
-### 4.1 关键解读
+layer id 对应关系：
 
-**1. `q_len=512` 的位置 = P 段**
+- `0, 4`: double-stream blocks，即 `transformer_blocks.0/4.attn`
+- `14`: single-stream 中段，即 `single_transformer_blocks.9.attn`
+- `24`: single-stream 最后一层，即 `single_transformer_blocks.19.attn`
 
-因为 q 从 token 0 开始截前 512 个，正好落在 `P=[0,512)` 上 —— 所以**这一条记录其实只测到了 "prompt 看哪些 token"**，不是 README 真正想要的 `X→...`。这是 smoke 的最大盲区。
+理论采样点是 `4 layers x 6 heads x 3 steps = 72`。实测 `distribution_rows=78`、`attention_blocks.jsonl` 有 13 条 block records，多出的 6 条来自 step 0 的额外 forward/prefill 行为，和 smoke 中的重复 step0 现象一致。
 
-**2. P→X 占 46.6%、P→P 占 37.6%、P→S 占 10.4%、P→R1 占 5.6%**
-
-- prompt 在最浅 double block 已经在**积极写入 noise target**（47% 注意力流向 X）—— 跟 MM-DiT 的设计直觉一致：text 流主要把语义注入图像流，自身只保留 1/3 注意力做内部协调。
-- **P 对 S 的关注度 (10.4%) ≈ P 对 R1 的关注度 (5.6%) 的 2 倍**。可能的解读：
-  - source 是"参考图"语义里的主体（要编辑的图），所以 prompt 偏向看它；
-  - 或者是 token 数量造成的（S 和 R1 token 数差不多，所以这个差距是真实的"per-token attention preference"，不是简单的基数效应）。
-  - **但这只是 layer 0 head 0 step 0 的一个数据点**，绝对不能推广到整个模型。
-
-**3. `normalized_entropy = 0.858` 非常高**
-
-P 段在第一层、第一步对全序列几乎是均匀注意 —— 这是 DiT 早期层的典型行为（"先看大局再聚焦"）。后续层应该会下降。下一轮 probe 看 `single_transformer_blocks.{8,12,16}` 这些中后层时，预计 normalized_entropy < 0.5，并出现明显的 head 专精。
-
-### 4.2 矩阵形状与软最大正确性
-
-8 个 q-block × 198 k-block 的矩阵：
-- 第 1 个 q-block（q tokens 0–63）的 198 个 cell 之和应 ≈ 1 (softmax 守恒)
-- 手动加总前几行：第一行（q-block 0）的 198 个 cell 之和约 1.0（验证略，但 segment_mass 四段相加 = 0.376 + 0.466 + 0.104 + 0.056 = 1.002，浮点近似 ≈ 1.0 ✓）
-
-→ probe 的 softmax / 切块逻辑数值正确。
-
-### 4.3 两条记录的来源
-
-`attention_records.jsonl` 和 `attention_blocks.jsonl` 都恰好是 **2 条**记录（都是 step 0 / layer 0 / head 0）。`attention_shapes.jsonl` 是 **701 条 = 25 × 28 + 1**。
-
-这说明在 timestep=0 这个时间点，`transformer_blocks.0.attn` 被 forward 了 **2 次**。最可能的原因：
-
-- Flux2 Klein 的 KV-cache **prefill 阶段**单独跑一次（先把 condition images 的 K/V 算出来缓存），然后正式 step 0 又跑一次；prefill 在 shape 日志里也会被算一次"额外调用"，所以 shape 日志多出 1 条。
-- 也可能是 `attention_records.jsonl` 在 `_auto_step_idx` 自增前后各记一次（manager 的 `_auto_step_idx` 初始 -1，第一次 forward 走到 0；第二次 forward 时 `ts_key` 没变，还是 0）。
-
-不影响结果，但下一轮可以把 record 里的 `kv_cache_mode` 字段值（现在是 null）开起来，看看是否能区分 prefill / decode。
-
----
-
-## 5. Auto-fit 尺寸推导（验证）
+### 2.2 尺寸、性能、显存
 
 `effective_run.json`：
 
+```json
+{
+  "first_image_size": [2571, 2048],
+  "rule": "scale_down_to_max_size",
+  "scale": 0.4462558703569987,
+  "height_out": 912,
+  "width_out": 1136,
+  "max_size": 1024
+}
 ```
-input  = 2571 × 2048 px  (面积 5.27 MP)
-max_size = 1024 → target_area = 1.05 MP
-scale  = √(1.05 / 5.27) = 0.4463
-new    = round(2571 × 0.4463) × round(2048 × 0.4463) = 1147 × 914
-floor16 = 1136 × 912   ← 912/16=57, 1136/16=71，均整除
-height_out = 912, width_out = 1136
+
+`timing_report.json` / `memory_report.json`：
+
+```json
+{
+  "elapsed_sec": 282.90,
+  "steps": 28,
+  "max_memory_allocated": 17876129280,
+  "oom": false,
+  "warnings": []
+}
 ```
 
-跟 `Flux2KleinPipeline._resize_to_target_area` 的算法完全一致（`pipeline_flux2_klein.py:769-785` + `image_processor.py:108-115`），只是把硬编码的 `1024 * 1024` 改成可配的 `max_size²`。
+关键点：
 
-**这意味着**：
-
-- 想把 token 数缩到 1/4（更快、更省内存），跑 `--max_size 512`，输出大约 456×568，X / S / R 各约 1000 tokens；
-- 想推到 1.5×（更细节），跑 `--max_size 1536`，输出大约 1376×1712，但**总 token 数会涨到 ~28k**，attention 内存按 O(L²) 增长 → 峰值显存按 (28/12)² ≈ 5.4× 估计要到 96 GB，单卡 64GB 直接 OOM。**1024 是当前单卡 64GB 的甜点**。
+- 运行无 OOM，峰值约 `17.9 GB`，和 smoke 基本一致。
+- wall time 从 smoke 的约 `68.5s` 增加到 `282.9s`，主要开销来自 sampled step 的显式 QK/softmax/block summary。
+- 日志中 step 0、14、27 明显变慢，符合 `sample_steps=[0,14,27]` 的预期；其他 step 仍接近正常推理速度。
 
 ---
 
-## 6. 当前 smoke 的盲区 → 下一步必须扩窗
+## 3. Token 布局确认
 
-`metrics_report.json` 已经把限制暴露得很清楚：
+`segment_map.json`：
 
-```
-num_summary_rows: 0           ← 没有 X→R* 行
-num_flow_rows: 8              ← 只有 4 条 P→{P,X,S,R1} × 2 record
-num_distribution_rows: 2      ← 只有 2 个分布点
-num_wrong_reference_rows: 0   ← wrong reference 也算不了
-```
+| 段 | 范围 | 长度 | 含义 |
+|---|---:|---:|---|
+| `P` | `[0, 512)` | 512 | prompt/text tokens |
+| `X` | `[512, 4559)` | 4047 | noisy target latent tokens |
+| `S` | `[4559, 8606)` | 4047 | source image tokens |
+| `R1` | `[8606, 12621)` | 4015 | reference image tokens |
 
-**原因**：`max_query_tokens_per_record=512` 把 q 切到了 P 段（[0,512)），所以观测到的只能是 `P→*`。要拿到 `X→*`，至少需要 q 覆盖到 `[512, 4559)`，即 q_len ≥ 4559。
+shape tail 中每个 denoising step 保持：
 
-### 推荐的下一轮配置
+- `hidden_states_shape = [1, 12109, 128]`
+- `encoder_hidden_states_shape = [1, 512, 7680]`
+- `img_ids_shape = [1, 12109, 4]`
+- `txt_ids_shape = [1, 512, 4]`
 
-复制一份 `probe_single_ref.yaml`（或者直接改 `probe_multi_ref.yaml`），把 probe 部分改成：
+这说明序列布局在整条 denoising trajectory 中稳定，没有动态裁剪 token。`max_query_tokens_per_record=12621` 覆盖完整 `[P, X, S, R1]` query，所以这次 light run 能回答 `X->S / X->R1 / X->P`。
+
+---
+
+## 4. Segment-Level 信息流
+
+### 4.1 全局平均 flow
+
+| Edge | Mean mass | 解释 |
+|---|---:|---|
+| `X->X` | 0.684 | target 大部分 attention 留在自身段 |
+| `R1->R1` | 0.675 | reference 自保持很强 |
+| `S->S` | 0.602 | source 自保持强 |
+| `P->P` | 0.513 | prompt 自保持中等 |
+| `P->X` | 0.307 | prompt 向 target 注入语义 |
+| `X->P` | 0.190 | target 主动读 prompt，且不只发生早期 |
+| `S->X` | 0.182 | source 对 target 有明显回写/对齐 |
+| `S->P` | 0.165 | source 读 prompt |
+| `R1->X` | 0.147 | reference 对 target 有回写 |
+| `R1->P` | 0.117 | reference 读 prompt |
+| `S->R1` | 0.116 | source 读 reference |
+| `R1->S` | 0.101 | reference 读 source |
+| `P->S` | 0.101 | prompt 读 source |
+| `P->R1` | 0.099 | prompt 读 reference |
+| `X->R1` | 0.093 | target 直接读 reference |
+| `X->S` | 0.076 | target 直接读 source |
+
+两个核心判断：
+
+1. `X->R1` 的全局均值不高，但存在极强 head；它不是全层均匀机制，而是 head-specialized routing。
+2. `X->P` 全局高于 `X->R1` 和 `X->S`，说明 prompt/text 在编辑过程中不是只做 early conditioning，而是在 sampled 中后层仍参与 target 更新。
+
+### 4.2 timestep 维度
+
+| Step | `X->S` | `X->R1` | `X->P` | `S->R1` | `R1->S` | `R1->X` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.106 | 0.079 | 0.186 | 0.096 | 0.118 | 0.126 |
+| 14 | 0.056 | 0.107 | 0.190 | 0.122 | 0.091 | 0.135 |
+| 27 | 0.059 | 0.097 | 0.194 | 0.136 | 0.091 | 0.183 |
+
+机制解读：
+
+- `X->S` 从 step0 的 `0.106` 降到中后期约 `0.056-0.059`，source preservation 更偏早期。
+- `X->R1` 从 step0 的 `0.079` 上升到 step14 的 `0.107`，说明 reference transfer 在中期更强。
+- `X->P` 从 `0.186` 到 `0.194` 基本不降，prompt influence 持续存在。
+- `R1->X` 到 step27 升到 `0.183`，说明后期 reference 对 target 的回写增强。
+- `S->R1` 随 step 增强，可能表示 source/ref 的背景或风格相关信息在后期融合。
+
+### 4.3 layer 维度
+
+| Layer | `X->S` | `X->R1` | `X->P` | `S->R1` | `R1->S` | `S->X` | `R1->X` |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.077 | 0.037 | 0.074 | 0.080 | 0.099 | 0.162 | 0.102 |
+| 4 | 0.100 | 0.137 | 0.095 | 0.082 | 0.076 | 0.082 | 0.055 |
+| 14 | 0.068 | 0.204 | 0.337 | 0.137 | 0.053 | 0.164 | 0.120 |
+| 24 | 0.059 | 0.013 | 0.291 | 0.178 | 0.178 | 0.326 | 0.325 |
+
+机制解读：
+
+- **Layer 0**：`P->X=0.463` 很强，早期 double-stream 主要负责 prompt 向 target 注入；`X->R1=0.037` 很弱。
+- **Layer 4**：`X->R1=0.137`、`X->S=0.100`，double-stream 末层开始出现 target 对 source/ref 的直接读取。
+- **Layer 14**：`X->R1=0.204` 和 `X->P=0.337` 同时高，是最关键的 single-stream reference-transfer + prompt-control 层。
+- **Layer 24**：`X->R1=0.013` 几乎关闭，但 `S->R1=0.178`、`R1->S=0.178`、`S->X=0.326`、`R1->X=0.325` 很强。最后层更像是 source/reference 之间做融合，然后共同回写 target，而不是 target 直接读取 R1。
+
+---
+
+## 5. Head Specialization
+
+### 5.1 Target 直接读取 reference：`X->R1`
+
+最高的 `X->R1` head：
+
+| Step | Layer | Head | `X->R1` |
+|---:|---:|---:|---:|
+| 14 | 14 | 12 | 0.828 |
+| 14 | 4 | 4 | 0.817 |
+| 0 | 14 | 12 | 0.728 |
+| 27 | 14 | 12 | 0.727 |
+| 27 | 4 | 4 | 0.539 |
+| 0 | 4 | 4 | 0.517 |
+
+结论：
+
+- `layer14/head12` 是最稳定、最强的 target-to-reference head，三个 sampled steps 都很高。
+- `layer4/head4` 是 double-stream 末层的强 reference-transfer head，在 step14 达到 `0.817`。
+- 因为全局 `X->R1` 均值只有 `0.093`，这些 head 是强专精而不是普遍行为。
+
+### 5.2 Source preservation：`X->S`
+
+最高的 `X->S` head：
+
+| Step | Layer | Head | `X->S` |
+|---:|---:|---:|---:|
+| 0 | 4 | 4 | 0.488 |
+| 0 | 24 | 20 | 0.250 |
+| 0 | 14 | 12 | 0.237 |
+| 0 | 4 | 0 | 0.161 |
+
+结论：
+
+- `X->S` 的强峰主要出现在 step0，符合“先锁定 source 结构，再逐步引入 ref”的机制假设。
+- `layer4/head4` 同时是强 `X->S` 和强 `X->R1` head，可能承担 source/ref 对齐或局部编辑区域绑定。
+
+### 5.3 Prompt control：`X->P`
+
+最高的 `X->P` head：
+
+| Step | Layer | Head | `X->P` |
+|---:|---:|---:|---:|
+| 27 | 14 | 20 | 0.958 |
+| 14 | 14 | 20 | 0.928 |
+| 27 | 24 | 20 | 0.867 |
+| 14 | 24 | 20 | 0.761 |
+| 0 | 14 | 16 | 0.729 |
+
+结论：
+
+- prompt 不是只在 early denoising 起作用。`layer14/head20` 在 step14/27 几乎专门读 prompt。
+- 对 background-change 任务，这可能是保持“只改背景”指令约束的关键 head。
+
+### 5.4 Source/Reference 融合与回写
+
+最高 cross edges：
+
+- `S->R1`: layer24/head8 在 step0/14 分别约 `0.462/0.463`
+- `R1->S`: layer24/head8 在 step14 约 `0.338`
+- `S->X`: layer24/head20 在 step14 约 `0.682`
+- `R1->X`: layer24/head12 在 step27 约 `0.697`
+
+结论：
+
+- 最后一层 single-stream 是明显的 fusion/writeback 层。
+- 这对后续 ablation 很关键：如果只 block `X->R1`，可能不能完全去掉 reference 影响，因为 `R1->S`、`R1->X`、`S->R1->X` 仍然可能传递 reference 信息。
+
+---
+
+## 6. Attention Distribution / 稀疏性
+
+整体 distribution：
+
+| Metric | Mean | Min | Max |
+|---|---:|---:|---:|
+| normalized token entropy | 0.540 | 0.200 | 0.870 |
+| top16 block mass | 9.188 | 3.118 | 15.127 |
+| normalized block entropy | 0.762 | 0.607 | 0.908 |
+| Gini blocks | 0.835 | 0.559 | 0.955 |
+
+按 step：
+
+| Step | Entropy | Top16 | Gini |
+|---:|---:|---:|---:|
+| 0 | 0.567 | 8.881 | 0.835 |
+| 14 | 0.537 | 9.329 | 0.834 |
+| 27 | 0.511 | 9.429 | 0.837 |
+
+按 layer：
+
+| Layer | Entropy | Top16 | Gini |
+|---:|---:|---:|---:|
+| 0 | 0.563 | 8.238 | 0.855 |
+| 4 | 0.417 | 10.990 | 0.924 |
+| 14 | 0.573 | 8.937 | 0.809 |
+| 24 | 0.600 | 8.902 | 0.745 |
+
+最低 entropy / 最稀疏的 head：
+
+| Step | Layer | Head | Entropy | Top16 | Gini |
+|---:|---:|---:|---:|---:|---:|
+| 27 | 0 | 20 | 0.200 | 10.830 | 0.938 |
+| 27 | 4 | 8 | 0.246 | 10.880 | 0.952 |
+| 14 | 0 | 20 | 0.249 | 11.038 | 0.947 |
+| 27 | 4 | 12 | 0.285 | 13.893 | 0.954 |
+
+机制判断：
+
+- Attention 并不均匀，尤其 layer4 很稀疏：entropy 最低、top16 和 Gini 最高。
+- 这支持后续做 sparse routing / reliability map，但必须 head/layer/step 条件化，不能用统一阈值。
+- Layer24 的 Gini 较低但跨段 flow 强，说明最后层可能更像全局融合/回写，不适合简单按 top-k sparse 裁剪。
+
+---
+
+## 7. 对研究目标的逐项回答
+
+### 7.1 Full attention 下的信息流
+
+已能回答单 ref 场景：
+
+- target/noisy tokens 直接 attend 到 reference：存在，`X->R1` 全局 `0.093`，强 head 最高 `0.828`。
+- source tokens 使用阶段：`X->S` 在 step0 更高，source preservation 偏早期；layer24 的 `S->X` 后期也强，说明 source 也参与最终回写。
+- prompt tokens 是否重要：重要，`X->P` 全局 `0.190`，layer14/head20 在 step14/27 接近 prompt-specialized。
+- source/reference 融合：存在，`S->R1`、`R1->S` 在 layer24 明显升高。
+
+尚不能回答：
+
+- `R1->R2` / `R2->R1` 多参考互相融合，因为当前只有一个 reference。
+
+### 7.2 layer/head/timestep 分工
+
+已观察到明显分工：
+
+- layer0：prompt 写入 target，`P->X` 强。
+- layer4：double-stream 末层有稀疏强 head，`head4` 同时强 `X->S` 与 `X->R1`。
+- layer14：reference transfer 和 prompt control 最强，`head12` 读 R1，`head20` 读 P。
+- layer24：source/ref 融合与对 target 回写最强，直接 `X->R1` 反而很低。
+
+### 7.3 多参考图之间 attention map
+
+当前单 ref 只能看 `S<->R1`，不能看 `R1<->R2`。但 `S<->R1` 已经说明 conditioning image tokens 之间会直接交互，后续多 ref 时必须重点检查 `R_i->R_j` 是否导致 reference contamination。
+
+### 7.4 高低分辨率一致性
+
+当前没有 low/high 对照。下一步需要用相同 source/ref/prompt/seed 跑：
+
+- low: max_size 512 或 768
+- high: max_size 1024
+
+然后比较：
+
+- segment-level `X->R1`、`X->S`、`X->P` correlation
+- block top-k overlap / Jaccard
+- JS divergence
+- reference binding consistency
+
+### 7.5 Reliability feature 候选
+
+| Feature | 当前证据 | 是否适合 |
+|---|---|---|
+| dense attention top-k useful edges | 强 head 很集中，如 `layer14/head12 X->R1`、`layer14/head20 X->P` | 适合，但要按 layer/head/step 条件化 |
+| ref-block ablation hidden/output impact | 当前未跑 ablation | 暂不能判断 |
+| low/high block edge agreement | 当前未跑 low/high | 暂不能判断 |
+| seed stability | 当前只 seed0 | 暂不能判断 |
+| segment mass profile | `X->R1`、`X->P`、`S<->R1` 有清晰层间差异 | 适合作为 coarse reliability feature |
+| entropy/Gini/top-k | layer4 稀疏性强，layer24 更融合 | 适合辅助判断是否可 sparse，但不能单独决定保留边 |
+
+---
+
+## 8. 对后续实验的建议
+
+### 8.1 先扩单 ref，不要直接 all heads 全量
+
+当前 light 配置已足够定位机制。下一步建议有控制地扩：
 
 ```yaml
-probe:
-  save_full_attention: false
-  save_block_attention: true
-  block_size: 64
-  sample_layers: [0, 2, 4, 7, 12, 17, 22]   # double 全覆盖 + single 等距 4 个
-  sample_heads: all                          # 24 个 head 全采
-  sample_steps: [0, 6, 14, 21, 27]          # 5 个时间点跨完 28 步
-  stream_to_disk: true
-  max_query_tokens_per_record: 12621        # 把整个 q 范围都覆盖（关键！）
+sample_layers: [0, 2, 4, 9, 14, 19, 24]
+sample_heads: [0, 4, 8, 12, 16, 20]
+sample_steps: [0, 7, 14, 21, 27]
+block_size: 256
+max_query_tokens_per_record: 12621
 ```
 
-预估开销（基于这次 smoke 的 17.8 GB peak + 2.4s/step）：
+暂时不要回到 `sample_heads: all + block_size: 128 + 9 layers`，step0 会非常慢。
 
-- q_len 从 512 涨到 12621 → 矩阵从 8×198 涨到 198×198 = 39,204 个 float（vs 1,584）。每条 block_record 字节大小 ≈ 25×。
-- 但每条 record 还附 24 head（vs 1 head）→ 再 ×24。
-- 单条 block_record 体积约 1.6 KB × 24 ≈ 40 KB，× 7 layers × 5 steps = 35 条 record × ~40 KB ≈ 1.4 MB（attention_blocks.jsonl）。可控。
-- attention 计算开销：q_len 12621 × k_len 12621 用 fp32 算 softmax 概率，单 head ~640 MB 中间体；24 head 顺序处理就 OK，不会爆。
-- **总耗时预期**：单 step 增加 0.5–1.5s 的 probe 开销 × 5 sample step = 多花 3–8s；总时长预计 75–80s（vs smoke 68s）。
-- **峰值显存预期**：probe 累积 + pipeline 本身 = 22–25 GB，仍有 40 GB 余量。
+### 8.2 多 ref 重点验证
 
-### 如果还想稳一档（先小规模验证）
+多参考时重点看：
 
-把 q_len 先放到 8192 而不是 12621，可以观察 `X→{S, R1, P}` 整片但还没覆盖 R1 尾部（4559+4047+ ~3500 < 12621），矩阵开销少一倍。
+- `X->R1/R2/R3` 是否由少数 head 分工绑定不同 reference
+- `R_i->R_j` 是否在 layer24 变强
+- `S->R_i->X` 是否形成间接 reference 注入路径
+- wrong-reference activation 是否集中在 layer24 的融合 head
 
----
+### 8.3 Ablation 优先级
 
-## 7. 待验证的机制性假设
+最小 ablation 不需要全层做，优先选：
 
-按 README §"Interpreting Results" 的指导，下一轮跑 multi-ref 配置后应能回答下面这些：
+1. block `X->R1` at `layer14/head12`
+2. block `X->P` at `layer14/head20`
+3. block `S<->R1` at `layer24/head8`
+4. block `R1->X` at `layer24/head12/20`
 
-1. **`X→S` vs `X→R1` 的层间走势**
-   - 假设 H1：早期 double layers（0–4）`X→S` 高（识别"要编辑的主体"），中后期 single layers `X→R1` 抬头（开始迁移参考属性）。
-   - 假设 H2：会有"识别 head"和"迁移 head"两类专精 —— 在 `head_specialization.png` 上应能直接看到。
-
-2. **Prompt influence over time**
-   - 假设：`X→P` 在前几步显著（语义注入），后几步衰减（高频细节阶段不再依赖文字）。
-
-3. **Reference binding consistency**
-   - 当前只有 1 ref，没法验证 binding。多 ref 配置才有意义（R1 = clothing, R2 = lighting）。
-
-4. **Top-k block mass 的层间变化**
-   - 假设：double layers `top16_block_mass` 低（≤ 0.2，注意力散），single layers 中段开始上升（≥ 0.5，注意力聚焦） —— 直接关系到能不能用 sparse routing。
-
-5. **`R1↔S` 直接交互强度**
-   - 这次 smoke 因为 q 段是 P，看不到。如果 multi-ref 跑出来 `S→R1` 和 `R1→S` 都很高，说明 source 和 ref 在 latent 空间已经直接交换信息（"contamination"），后续要做 ablation 时这条边权要重点关注。
+这些边的 mass 高且语义明确，最可能产生可观测 hidden/output deviation。
 
 ---
 
-## 8. 不影响功能但值得注意的现象
+## 9. 工程状态与注意事项
 
-- **702 条 shape record vs 700 的理论值**：多出来的 2 条来自 prefill / kv_cache 阶段的额外 forward。如果下一轮把 `kwargs_shapes.kv_cache_mode` 真值打开，应能直接看到 `prefill` 和 `decode` 两态。
-- **`num_ref_tokens: 0` 在 double block 的 record 里**：这是 pipeline 的实现细节 —— double block 不知道有多少是 ref，只有 single block 才用这个分段信息（参考 `pipeline_flux2_klein.py` 对 single block 的传参）。要在 single block 的 record 里才能看到非零值。
-- **`torch_npu` 在 `check_env` 中报 `register_pytree_node` 误报**：跟实际功能无关 —— `pkg_version("torch_npu")` 在 `import torch_npu` 时触发了 transformers 的内部路径，但 diffusers 的 shim 还没机会生效。env_report 里 `backend.available=True`、`device_name=Ascend910B2` 已经正确反映了真实状态。
+- NPU backend 路径稳定，无 CUDA/xformers/flash-attn 依赖。
+- `Flux2KleinPipeline` 加载组件完整：
+  - `vae = AutoencoderKLFlux2`
+  - `text_encoder = Qwen3ForCausalLM`
+  - `tokenizer = Qwen2TokenizerFast`
+  - `scheduler = FlowMatchEulerDiscreteScheduler`
+  - `transformer = Flux2Transformer2DModel`
+- 当前环境里旧 `attention_hooks.py` 不支持 `max_query_tokens_per_record: all` 时会报：
+  - `TypeError("'>' not supported between instances of 'int' and 'str'")`
+- 兼容旧代码时使用数字 `12621`。如果换输入尺寸，必须重新根据 `segment_map.json` 的总 token 长度更新这个值，或者同步支持 `all/auto/full` 的新版 `attention_hooks.py`。
 
 ---
 
-## 9. 一句话总结
+## 10. 最终判断
 
-> **机制管线完全打通，token 布局符合 README 约定，但当前 smoke 的采样窗口只能告诉我们"prompt 在最浅层均匀注意"。要回答 FLUX.2 Klein 多参考编辑机制的核心问题（`X→S` 保形、`X→R` 迁移、`X→P` 听话），必须把 `max_query_tokens_per_record` 提到 ≥ 4559，并把 `sample_layers/heads/steps` 扩到 multi-ref 配置 —— 单卡 64GB 完全跑得动。**
+这次 single-ref light run 已经给出第一批有效机制证据：
+
+1. **target 直接读 reference 是真实存在的**，但集中在少数 head，不是全局均匀行为。
+2. **prompt 在中后层仍强**，尤其 `layer14/head20` 和 `layer24/head20`，不能假设 text 只影响 early denoising。
+3. **source/ref 会在 conditioning token 间直接融合**，尤其最后 single block；这对多参考 contamination 风险很重要。
+4. **attention 天然具备稀疏结构**，layer4 最明显，适合作为后续 sparse routing / reliability map 的 teacher signal。
+5. 当前还不能回答多参考绑定、low/high 一致性和 ablation 因果影响；这些是下一阶段实验。
