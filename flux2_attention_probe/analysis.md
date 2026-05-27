@@ -404,8 +404,8 @@ PYTHONPATH=$PWD/../src \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
 python3 scripts/run_probe.py \
   --config configs/probe_mechanism_heavy.yaml \
-  --source "$SOURCE_IMAGE" \
-  --refs "$REFERENCE_IMAGE" \
+  --source "$REF1" \
+  --refs "$REF2" \
   --prompt "Change the background of the first image to that of the second image." \
   --num_inference_steps 28 \
   --seed 0 \
@@ -500,7 +500,215 @@ python3 scripts/summarize_probe.py \
 
 ---
 
-## 10. 最终判断
+## 10. 重型验证结果诊断与轻量对比
+
+> 数据来源：
+> - heavy: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy`
+> - light: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light`
+>
+> 注意：heavy 和 light 使用的是不同输入图片，因此即使 heavy 重新跑出有效 attention，也不能把数值差异全部解释成“轻量采样 vs 重量采样”造成的；输入图的主体、背景、ref 相似度、构图比例都会影响 attention 稀疏性和跨段 flow。
+
+### 10.1 Heavy run 状态：生成成功，但 attention 指标无效
+
+heavy run 的 pipeline、NPU、生成链路是成功的：
+
+| 项 | Heavy |
+|---|---:|
+| 输出尺寸 | `1248 x 832` |
+| denoising steps | `28` |
+| elapsed | `84.75s` |
+| peak memory | `17.88GB` |
+| OOM | `false` |
+| attention modules registered | `25` |
+
+heavy 的输入/输出图：
+
+![heavy input grid](analysis_assets/mechanism_single_ref_heavy/input_grid.png)
+
+![heavy generated image](analysis_assets/mechanism_single_ref_heavy/generated.png)
+
+但是 heavy 的 attention probe 没有产生有效 block summary：
+
+| 文件/指标 | Heavy 结果 | 含义 |
+|---|---:|---|
+| `attention_records.jsonl` | `701` 行 | 全部是错误记录 |
+| `attention_blocks.jsonl` | 不存在 | 没有任何 block-level attention matrix |
+| `metrics_report.num_flow_rows` | `0` | 没有 segment-level flow |
+| `metrics_report.num_distribution_rows` | `0` | 没有 entropy/top-k/Gini |
+| `figures/` | 空目录 | 没有可解释 attention 图 |
+
+错误完全一致：
+
+```text
+TypeError("'>' not supported between instances of 'int' and 'str'")
+```
+
+原因是 `configs/probe_mechanism_heavy.yaml` 使用：
+
+```yaml
+max_query_tokens_per_record: all
+```
+
+而本次运行使用的 `attention_hooks.py` 仍把 `max_query_tokens_per_record` 当成整数比较，导致每一层每一步的 probe 都失败。701 条错误对应：
+
+- step0 有一次额外 forward：layer0 出现 29 次，其余 layer 28 次。
+- 共覆盖 25 个 attention module 和 28 个 denoising step。
+- 覆盖范围是“重型”的，但 attention 统计没有落盘。
+
+因此这次 heavy 只能说明：**模型推理成功、token segment 自动推断成功、hook 注册成功，但 attention summary 失败**。它不能用于回答 `X->R1`、`S<->R1`、entropy、top-k、Gini 的重量化机制问题。
+
+### 10.2 Heavy token 布局与 light 的输入差异
+
+heavy 的 `segment_map.json`：
+
+| Segment | Range | Length |
+|---|---:|---:|
+| `P` | `[0, 512)` | 512 |
+| `X` | `[512, 4568)` | 4056 |
+| `S` | `[4568, 8624)` | 4056 |
+| `R1` | `[8624, 12680)` | 4056 |
+
+light 的 `segment_map.json`：
+
+| Segment | Range | Length |
+|---|---:|---:|
+| `P` | `[0, 512)` | 512 |
+| `X` | `[512, 4559)` | 4047 |
+| `S` | `[4559, 8606)` | 4047 |
+| `R1` | `[8606, 12621)` | 4015 |
+
+差异解释：
+
+- heavy 输入首图是 `2048 x 3072`，auto-fit 后输出 `1248 x 832`。
+- light 输入首图是 `2571 x 2048`，auto-fit 后输出 `912 x 1136`。
+- 两者总 token 长度接近，heavy 为 `12680`，light 为 `12621`，但几何长宽比例不同：heavy 更偏竖图，light 更偏横图。
+- 这会影响 block attention 的空间邻接关系和 top-k block overlap；后续不能用 light 的 head/layer 结论直接替代 heavy 输入图的稀疏路由策略。
+
+### 10.3 Light 有效 attention 结果回顾
+
+light run 是当前唯一有效的 single-ref attention 机制结果。它的关键 flow：
+
+| Edge | Light mean mass | 解释 |
+|---|---:|---|
+| `X->X` | 0.684 | target 自保持主导 |
+| `X->P` | 0.190 | target 持续读取 prompt |
+| `X->R1` | 0.093 | target 直接读取 reference，但均值不高 |
+| `X->S` | 0.076 | target 直接读取 source，偏早期 |
+| `S->R1` | 0.116 | source/reference 有直接交互 |
+| `R1->S` | 0.101 | reference/source 有直接交互 |
+| `S->X` | 0.182 | source 对 target 回写明显 |
+| `R1->X` | 0.147 | reference 对 target 回写明显 |
+
+light 的 timestep 维度：
+
+| Step | `X->S` | `X->R1` | `X->P` | `S->R1` | `R1->S` | `R1->X` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.106 | 0.079 | 0.186 | 0.096 | 0.118 | 0.126 |
+| 14 | 0.056 | 0.107 | 0.190 | 0.122 | 0.091 | 0.135 |
+| 27 | 0.059 | 0.097 | 0.194 | 0.136 | 0.091 | 0.183 |
+
+light 的 layer 维度：
+
+| Layer | `X->S` | `X->R1` | `X->P` | `S->R1` | `R1->S` | `S->X` | `R1->X` |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.077 | 0.037 | 0.074 | 0.080 | 0.099 | 0.162 | 0.102 |
+| 4 | 0.100 | 0.137 | 0.095 | 0.082 | 0.076 | 0.082 | 0.055 |
+| 14 | 0.068 | 0.204 | 0.337 | 0.137 | 0.053 | 0.164 | 0.120 |
+| 24 | 0.059 | 0.013 | 0.291 | 0.178 | 0.178 | 0.326 | 0.325 |
+
+light 的最强 `X->R1` heads：
+
+| Step | Layer | Head | `X->R1` |
+|---:|---:|---:|---:|
+| 14 | 14 | 12 | 0.828 |
+| 14 | 4 | 4 | 0.817 |
+| 0 | 14 | 12 | 0.728 |
+| 27 | 14 | 12 | 0.727 |
+| 27 | 4 | 4 | 0.539 |
+| 0 | 4 | 4 | 0.517 |
+
+light 的稀疏性统计：
+
+| Metric | Light |
+|---|---:|
+| normalized entropy mean | 0.540 |
+| normalized entropy min | 0.200 |
+| normalized entropy max | 0.870 |
+| top16 block mass mean | 9.188 |
+
+这些结论仍然成立，但只对 light 输入图成立。由于 heavy 输入图不同，后续必须重新跑成功的 heavy attention summary，再判断 `layer14/head12`、`layer4/head4`、`layer24` fusion/writeback 是否跨输入稳定。
+
+### 10.4 图表坐标解释
+
+当前仓库内 light 图的坐标含义如下：
+
+- `segment_flow_heatmap.png`
+  - 横坐标：key/value segment，即 attention 读的是哪个 token 段，例如 `P`、`X`、`S`、`R1`。
+  - 纵坐标：query segment，即发起 attention 的 token 段。
+  - 单元格颜色：从纵轴 segment 到横轴 segment 的平均 attention mass。比如 `X` 行、`R1` 列就是 `X->R1`。
+
+- `x_to_refs_by_step.png`
+  - 横坐标：denoising step index，本次 light 只有 `0/14/27` 三个采样点。
+  - 纵坐标：`X->Rk` segment attention mass。
+  - 曲线含义：target/noisy tokens 在不同 step 读取 reference segment 的强度。单 ref 时只有 `R1`。
+
+- `reference_reference_heatmap.png`
+  - 横坐标：被读取的 reference/source-like segment。
+  - 纵坐标：发起读取的 reference/source-like segment。
+  - 单元格颜色：conditioning image tokens 之间的互读强度。单 ref 下重点看 `S->R1`、`R1->S`；多 ref 时才看 `R1->R2`、`R2->R1`。
+
+- `head_specialization.png`
+  - 横坐标：被跟踪的 edge，例如 `X->S`、`X->R1`、`X->P`、`S->R1` 等。
+  - 纵坐标：layer/head 组合，通常形如 `L14/H12`。
+  - 颜色：该 layer/head 对应 edge 的 attention mass。亮色表示该 head 对该方向更专精。
+
+- `entropy_topk_distribution.png`
+  - 横坐标：attention 分布指标数值，例如 normalized entropy、top-k block mass、Gini。
+  - 纵坐标：出现频次或 density，表示 sampled layer/head/step 上这些指标的分布。
+  - 解释：entropy 越低、top-k mass/Gini 越高，说明该 head/layer/step 越适合 sparse routing；但要结合具体 edge 判断，不应只看一个全局阈值。
+
+heavy 本次没有 attention 图。它的 `input_grid.png` 和 `generated.png` 不是 attention 图，没有横纵坐标；它们只用于确认输入图、reference 图和生成输出。
+
+### 10.5 修复与重跑命令
+
+已修复 `attention_hooks.py`，`max_query_tokens_per_record` 现在支持：
+
+```yaml
+max_query_tokens_per_record: all
+max_query_tokens_per_record: auto
+max_query_tokens_per_record: full
+```
+
+修复后重跑 heavy：
+
+```bash
+DIR=/home/ma-user/work/algorithm/algorithm_lyr/results/mechanism_single_ref_heavy_v2
+
+ASCEND_VISIBLE_DEVICES=2 \
+PYTHONPATH=$PWD/../src \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism_heavy.yaml \
+  --source "$REF1" \
+  --refs "$REF2" \
+  --prompt "Change the background of the first image to that of the second image." \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir "$DIR"
+```
+
+如果想避免依赖新版代码，也可以把 heavy config 改成当前输入图对应的数字：
+
+```yaml
+max_query_tokens_per_record: 12680
+```
+
+但这只适用于本次 heavy 输入尺寸。换图后仍建议用 `all`。
+
+---
+
+## 11. 最终判断
 
 这次 single-ref light run 已经给出第一批有效机制证据：
 

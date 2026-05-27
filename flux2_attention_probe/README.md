@@ -104,8 +104,8 @@ PYTHONPATH=$PWD/../src \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
 python3 scripts/run_probe.py \
   --config configs/probe_mechanism_heavy.yaml \
-  --source "$SOURCE_IMAGE" \
-  --refs "$REFERENCE_IMAGE" \
+  --source "$REF1" \
+  --refs "$REF2" \
   --prompt "Change the background of the first image to that of the second image." \
   --num_inference_steps 28 \
   --seed 0 \

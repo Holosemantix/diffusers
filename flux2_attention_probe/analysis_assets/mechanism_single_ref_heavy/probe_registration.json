@@ -1,0 +1,42 @@
+{
+  "num_attention_modules": 25,
+  "modules": [
+    "transformer_blocks.0.attn",
+    "transformer_blocks.1.attn",
+    "transformer_blocks.2.attn",
+    "transformer_blocks.3.attn",
+    "transformer_blocks.4.attn",
+    "single_transformer_blocks.0.attn",
+    "single_transformer_blocks.1.attn",
+    "single_transformer_blocks.2.attn",
+    "single_transformer_blocks.3.attn",
+    "single_transformer_blocks.4.attn",
+    "single_transformer_blocks.5.attn",
+    "single_transformer_blocks.6.attn",
+    "single_transformer_blocks.7.attn",
+    "single_transformer_blocks.8.attn",
+    "single_transformer_blocks.9.attn",
+    "single_transformer_blocks.10.attn",
+    "single_transformer_blocks.11.attn",
+    "single_transformer_blocks.12.attn",
+    "single_transformer_blocks.13.attn",
+    "single_transformer_blocks.14.attn",
+    "single_transformer_blocks.15.attn",
+    "single_transformer_blocks.16.attn",
+    "single_transformer_blocks.17.attn",
+    "single_transformer_blocks.18.attn",
+    "single_transformer_blocks.19.attn"
+  ],
+  "config": {
+    "output_dir": "/home/ma-user/work/algorithm/algorithm_lyr/results/mechanism_single_ref_heavy",
+    "save_full_attention": false,
+    "save_block_attention": true,
+    "block_size": 256,
+    "sample_layers": "all",
+    "sample_heads": "all",
+    "sample_steps": "all",
+    "stream_to_disk": true,
+    "max_query_tokens_per_record": "all",
+    "record_shapes": true
+  }
+}

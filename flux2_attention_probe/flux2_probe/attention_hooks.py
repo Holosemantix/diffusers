@@ -360,14 +360,28 @@ def torch_cat(values, dim=0):
     return _torch().cat(values, dim=dim)
 
 
-def compute_block_attention_summary(query, key, heads: list[int], block_size: int, max_query_tokens: int | None, segment_ranges):
+def _resolve_max_query_tokens(max_query_tokens: int | str | None, q_len: int) -> int | None:
+    if max_query_tokens is None:
+        return None
+    if isinstance(max_query_tokens, str):
+        value = max_query_tokens.strip().lower()
+        if value in {"", "none", "null", "all", "auto", "full"}:
+            return None
+        return int(value)
+    return int(max_query_tokens)
+
+
+def compute_block_attention_summary(
+    query, key, heads: list[int], block_size: int, max_query_tokens: int | str | None, segment_ranges
+):
     torch = _torch()
     q = query[:, :, heads, :].detach()
     k = key[:, :, heads, :].detach()
     batch, q_len, num_heads, dim = q.shape
     k_len = k.shape[1]
+    max_query_tokens = _resolve_max_query_tokens(max_query_tokens, q_len)
     if max_query_tokens is not None and q_len > max_query_tokens:
-        q_len_eff = int(max_query_tokens)
+        q_len_eff = max(1, int(max_query_tokens))
         q = q[:, :q_len_eff]
         q_len = q_len_eff
 
