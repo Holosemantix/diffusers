@@ -63,6 +63,69 @@ python3 scripts/run_probe.py --config configs/probe_single_ref.yaml
 
 This defaults to 512x512, one denoising step, one layer, one head, and `max_query_tokens_per_record: 512`.
 
+## Single-Reference Mechanism Probe
+
+The smoke config above verifies the pipeline and hook path, but it only records the first 512 query tokens. In the observed `[P, X, S, R1]` layout this means it mostly measures `P->*`, not target/source/reference behavior.
+
+Use `configs/probe_mechanism.yaml` for the first real single source + single reference mechanism run:
+
+```bash
+ASCEND_VISIBLE_DEVICES=2 \
+PYTHONPATH=$PWD/../src \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism.yaml \
+  --source "$REF1" \
+  --refs "$REF2" \
+  --prompt "Change the background of the first image to that of the second image." \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir /home/ma-user/work/algorithm/algorithm_lyr/results/mechanism_single_ref
+```
+
+This samples all 5 double-stream blocks plus 4 single-stream blocks, all heads, and steps `[0, 7, 14, 21, 27]`. For the current 912x1136 auto-fit run, `max_query_tokens_per_record: 12621` covers the full query sequence, so the output includes `X->S`, `X->R1`, `X->P`, `S->R1`, and `R1->S`. On newer code paths, `all` / `auto` / `full` are also accepted.
+
+For this single-ref setting, answer these questions first:
+
+- Does `X->S` dominate early layers or early steps? That is the source-preservation path.
+- Does `X->R1` rise in middle or late layers? That is direct reference transfer.
+- Does `S->R1` or `R1->S` become strong? That indicates source/reference fusion before the target reads the result.
+- Does `X->P` decay over denoising steps? That tells whether prompt tokens mainly set early semantic direction.
+- Which layer/head rows in `figures/head_specialization.png` isolate `X->S`, `X->R1`, or `X->P`? Those heads are the first candidates for later sparse routing or ablation.
+
+## Heavy Single-Reference Mechanism Probe
+
+After the light mechanism run is stable, use `configs/probe_mechanism_heavy.yaml` to sample every attention layer at every timestep:
+
+```bash
+ASCEND_VISIBLE_DEVICES=2 \
+PYTHONPATH=$PWD/../src \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism_heavy.yaml \
+  --source "$SOURCE_IMAGE" \
+  --refs "$REFERENCE_IMAGE" \
+  --prompt "Change the background of the first image to that of the second image." \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy
+```
+
+The heavy config uses:
+
+```yaml
+sample_layers: all
+sample_heads: all
+sample_steps: all
+max_query_tokens_per_record: all
+block_size: 256
+save_full_attention: false
+```
+
+Expected coverage is about `25 layers x 28 steps = 700` block records, with all 24 heads inside each record. If runtime or memory is too high, reduce `max_size`, increase `block_size`, or sample fewer heads before reducing layers/steps.
+
 ## Multi-Reference Probe
 
 Edit `configs/probe_multi_ref.yaml`:
@@ -206,4 +269,3 @@ Every run writes `memory_report.json`; unsupported NPU memory APIs return `null`
 - Saving full attention maps can OOM even on 64 GB HBM.
 - Segment ranges may need manual calibration if the pipeline changes input layout.
 - Multi-reference input semantics are based on the current inspected `Flux2KleinPipeline`, where `image=[source, ref1, ref2...]` becomes conditioning image tokens.
-

@@ -29,6 +29,36 @@
 
 > 在单 source + 单 ref 的 background-change 任务中，FLUX.2 Klein 并不是均匀地把 reference 注入 target。绝大多数 token 仍以自段注意为主，但少数 layer/head 承担很强的跨段路由：layer4/head4 和 layer14/head12 是最明显的 `X->R1` reference-transfer head，layer14/24 的若干 head 强烈保留 `X->P` prompt 约束，layer24 则出现明显 `S<->R1` 与 `S/R1->X` 融合/回写。
 
+### 1.1 关键可视化
+
+以下图片已经从轻量实验结果目录复制到代码仓内，路径为 `flux2_attention_probe/analysis_assets/mechanism_single_ref_light/`，可以随 `analysis.md` 一起提交到 GitHub。
+
+输入 source/ref 与最终生成图：
+
+![input grid](analysis_assets/mechanism_single_ref_light/input_grid.png)
+
+![generated image](analysis_assets/mechanism_single_ref_light/generated.png)
+
+Segment flow 总览。该图用于快速判断 `P/X/S/R1` 四段之间的主方向：自段注意仍占主导，但 `X->P`、`X->R1`、`S->R1`、`R1->X` 都有可观质量，说明 reference/prompt/source 都进入了 target 更新路径。
+
+![segment flow heatmap](analysis_assets/mechanism_single_ref_light/figures/segment_flow_heatmap.png)
+
+`X->R1` 随 timestep 的变化。当前 light run 只采样 step 0/14/27，因此更像机制定位而非连续曲线；趋势上中期 `X->R1` 更强，后期 `R1->X` 回写增强。
+
+![x to refs by step](analysis_assets/mechanism_single_ref_light/figures/x_to_refs_by_step.png)
+
+Head specialization。后续 sparse routing 不应该用统一阈值，而应优先保留强专精 head，例如 `layer14/head12` 的 `X->R1`、`layer14/head20` 的 `X->P`、`layer24/head8` 的 `S<->R1`。
+
+![head specialization](analysis_assets/mechanism_single_ref_light/figures/head_specialization.png)
+
+Entropy / top-k / Gini 分布。Layer/head 差异明显，说明 full attention teacher 中确实存在天然稀疏结构，但最后层的融合性质更强，不能简单按 top-k 一刀切。
+
+![entropy topk distribution](analysis_assets/mechanism_single_ref_light/figures/entropy_topk_distribution.png)
+
+当前是单 reference，所以 reference-reference 图只能体现 `S<->R1` / conditioning token 交互，不能回答 `R1<->R2` 多参考污染问题。
+
+![reference reference heatmap](analysis_assets/mechanism_single_ref_light/figures/reference_reference_heatmap.png)
+
 ---
 
 ## 2. 实验配置与运行稳定性
@@ -115,6 +145,8 @@ shape tail 中每个 denoising step 保持：
 ## 4. Segment-Level 信息流
 
 ### 4.1 全局平均 flow
+
+从 `attention_blocks.jsonl` 直接聚合得到的平均 segment mass：
 
 | Edge | Mean mass | 解释 |
 |---|---:|---|
@@ -360,6 +392,78 @@ max_query_tokens_per_record: 12621
 
 暂时不要回到 `sample_heads: all + block_size: 128 + 9 layers`，step0 会非常慢。
 
+### 8.1.1 重型验证：每层、每个 timestep
+
+如果要做你说的“重量化验证”，即每一层、每一个 timestep 都验证，并且保留所有 head 与完整 `[P, X, S, R1]` query 序列，直接使用新增配置：
+
+```bash
+cd /home/ag/projects_anguo/diffusers/flux2_attention_probe
+
+ASCEND_VISIBLE_DEVICES=2 \
+PYTHONPATH=$PWD/../src \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism_heavy.yaml \
+  --source "$SOURCE_IMAGE" \
+  --refs "$REFERENCE_IMAGE" \
+  --prompt "Change the background of the first image to that of the second image." \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy
+```
+
+这个配置的关键字段是：
+
+```yaml
+probe:
+  save_full_attention: false
+  save_block_attention: true
+  block_size: 256
+  sample_layers: all
+  sample_heads: all
+  sample_steps: all
+  max_query_tokens_per_record: all
+generation:
+  max_size: 1024
+  num_inference_steps: 28
+```
+
+预期覆盖：
+
+- 25 个 attention module：`5` 个 double-stream + `20` 个 single-stream。
+- 28 个 denoising timesteps。
+- 24 个 heads。
+- 完整 query/key 序列，所以会统计 `P->*`、`X->*`、`S->*`、`R1->*` 所有方向。
+- 理论主记录规模约 `25 layers x 28 steps = 700` 条 block records；如果 pipeline 有额外 prefill/重复 step0，会略多。
+
+预期成本与风险：
+
+- 这是 full teacher 的重型统计，不保存完整 `N x N` attention，只保存 block summary。
+- 在当前 912x1136 auto-fit、单 source + 单 ref、28 steps 下，建议先用 `block_size: 256`；`block_size: 128` 会显著增加 JSONL 体积和后处理时间。
+- 如果 NPU runtime 太慢或 OOM，优先按顺序降级：
+  1. `max_size: 768`
+  2. `sample_heads: [0, 4, 8, 12, 16, 20]`
+  3. `block_size: 512`
+  4. `num_inference_steps: 14`
+  5. 保持 `save_full_attention: false`
+
+重型跑完后生成汇总图和表：
+
+```bash
+cd /home/ag/projects_anguo/diffusers/flux2_attention_probe
+
+python3 scripts/summarize_probe.py \
+  --input_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy \
+  --config configs/probe_mechanism_heavy.yaml
+```
+
+重型验证重点看三件事：
+
+1. light run 找到的关键 head 是否在未采样的 timestep/layer 上仍稳定，例如 `layer14/head12 X->R1`、`layer14/head20 X->P`。
+2. `X->S` 是否只在早期强，还是有局部 late-step 回升。
+3. `S<->R1` 与 `R1->X` 是否只集中在 layer24，还是在 single-stream 后半段逐步增强。
+
 ### 8.2 多 ref 重点验证
 
 多参考时重点看：
@@ -391,9 +495,8 @@ max_query_tokens_per_record: 12621
   - `tokenizer = Qwen2TokenizerFast`
   - `scheduler = FlowMatchEulerDiscreteScheduler`
   - `transformer = Flux2Transformer2DModel`
-- 当前环境里旧 `attention_hooks.py` 不支持 `max_query_tokens_per_record: all` 时会报：
-  - `TypeError("'>' not supported between instances of 'int' and 'str'")`
-- 兼容旧代码时使用数字 `12621`。如果换输入尺寸，必须重新根据 `segment_map.json` 的总 token 长度更新这个值，或者同步支持 `all/auto/full` 的新版 `attention_hooks.py`。
+- 当前 `attention_hooks.py` 已支持 `max_query_tokens_per_record: all/auto/full`，重型配置可以直接覆盖完整 query 序列。
+- 如果回到旧代码或需要复现实验，使用数字 `12621` 可精确覆盖这次 912x1136 auto-fit 下的 `[P, X, S, R1]`；换输入尺寸时应改用 `all` 或根据新的 `segment_map.json` 总 token 长度更新该数值。
 
 ---
 
