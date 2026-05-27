@@ -3,8 +3,8 @@
 # Goal: cover X→{S, R1, P} flows across the full denoising trajectory by
 # sampling all 5 double blocks + 4 evenly spaced single blocks, all 24 heads,
 # and 5 timesteps spread across 28 steps. The key knob is
-# ``max_query_tokens_per_record: all`` which removes the q-truncation that
-# limited the smoke run to the prompt (P) segment.
+# ``max_query_tokens_per_record: 12621`` which removes the q-truncation that
+# limited the smoke run to the prompt (P) segment for the current 912x1136 run.
 #
 # Expected cost on Ascend 910B2 (64 GB HBM), 912x1136, 28 steps:
 #   - probe overhead ~ 12-18 min on top of pipeline forward
@@ -50,7 +50,7 @@ probe:
   sample_heads: all                                # all 24 heads — needed for head specialization
   sample_steps: [0, 7, 14, 21, 27]                # early/mid/late of 28
   stream_to_disk: true
-  max_query_tokens_per_record: all                 # cover all [P, X, S, R1] queries after auto-fit
+  max_query_tokens_per_record: 12621               # cover all [P, X, S, R1] queries for this auto-fit size
   record_shapes: true
 
 generation:
