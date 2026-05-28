@@ -126,6 +126,19 @@ save_full_attention: false
 
 Expected coverage is about `25 layers x 28 steps = 700` block records, with all 24 heads inside each record. If runtime or memory is too high, reduce `max_size`, increase `block_size`, or sample fewer heads before reducing layers/steps.
 
+## Light/Heavy Comparison
+
+Compare a light run against a heavy run from the same input image pair by slicing heavy to the exact light layer/head/step subset first:
+
+```bash
+python3 scripts/compare_light_heavy.py \
+  --light_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new \
+  --heavy_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/compare_light_heavy_v2
+```
+
+The report is `compare_light_heavy_v2_report.md`; CSV tables and figures are written under the output directory.
+
 ## Multi-Reference Probe
 
 Edit `configs/probe_multi_ref.yaml`:

@@ -717,3 +717,156 @@ max_query_tokens_per_record: 12680
 3. **source/ref 会在 conditioning token 间直接融合**，尤其最后 single block；这对多参考 contamination 风险很重要。
 4. **attention 天然具备稀疏结构**，layer4 最明显，适合作为后续 sparse routing / reliability map 的 teacher signal。
 5. 当前还不能回答多参考绑定、low/high 一致性和 ablation 因果影响；这些是下一阶段实验。
+
+---
+
+## 12. Light New vs Heavy V2 同输入对比
+
+> 数据来源：
+> - light_new: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new`
+> - heavy_v2: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy`
+> - compare output: `/home/ag/projects_anguo/results/attention_i2i/compare_light_heavy_v2`
+>
+> 这组 light/heavy 使用同一组输入图、同一 prompt、同一 seed、同一输出尺寸 `1248 x 832`，适合做后续 ablation study 的机制一致性校准。
+
+完整对比报告已写入仓库：
+
+- [compare_light_heavy_v2_report.md](analysis_assets/compare_light_heavy_v2/compare_light_heavy_v2_report.md)
+- [light_vs_heavy_slice_edge_metrics.csv](analysis_assets/compare_light_heavy_v2/light_vs_heavy_slice_edge_metrics.csv)
+- [key_mechanism_replication.csv](analysis_assets/compare_light_heavy_v2/key_mechanism_replication.csv)
+- [sampling_bias_summary.csv](analysis_assets/compare_light_heavy_v2/sampling_bias_summary.csv)
+
+### 12.1 对比方法
+
+不能直接比较 light mean 和 heavy full mean，因为 light 是子采样：
+
+```yaml
+layers: [0, 4, 14, 24]
+heads: [0, 4, 8, 12, 16, 20]
+steps: [0, 14, 27]
+```
+
+heavy_v2 是全量：
+
+```yaml
+layers: all 25
+heads: all 24
+steps: all 28
+```
+
+因此先从 heavy_v2 中切出完全相同的 layer/head/step 子集，得到 `heavy_slice`，再和 light_new 按 `(step, layer, head, query_segment, key_segment)` join。只有 `light_new vs heavy_slice` 一致后，才能用 `heavy_full` 分析 light 是否有采样偏差。
+
+### 12.2 Metadata sanity check
+
+| 项 | 结果 |
+|---|---|
+| prompt/seed/height/width/steps | 一致 |
+| segment lengths | 一致：`P=512, X=4056, S=4056, R1=4056` |
+| generated.png pixel diff | `L1=0, L2=0, max_diff=0` |
+| light metrics | `num_flow_rows=1152`, `num_distribution_rows=72` |
+| heavy metrics | `num_flow_rows=269184`, `num_distribution_rows=16824` |
+
+这说明 light_new 和 heavy_v2 是同一输入、同一生成结果下的 attention 采样差异，不再混入输入图差异。
+
+### 12.3 Light vs Heavy Slice 一致性
+
+`heavy_slice` 与 `light_new` 在核心 edge 上完全复现，最大 mean abs diff 只有 `0.0003`：
+
+| Edge | Light mean | Heavy slice mean | Abs diff | Pearson | Top10 overlap |
+|---|---:|---:|---:|---:|---:|
+| `X->S` | 0.0924 | 0.0924 | 0.0000 | 1.0000 | 1.0000 |
+| `X->R1` | 0.0853 | 0.0853 | 0.0000 | 1.0000 | 1.0000 |
+| `X->P` | 0.2104 | 0.2104 | 0.0000 | 1.0000 | 1.0000 |
+| `S->R1` | 0.1148 | 0.1148 | 0.0000 | 1.0000 | 1.0000 |
+| `R1->S` | 0.1088 | 0.1086 | 0.0003 | 0.9997 | 1.0000 |
+| `S->X` | 0.1937 | 0.1937 | 0.0000 | 1.0000 | 1.0000 |
+| `R1->X` | 0.2250 | 0.2247 | 0.0002 | 1.0000 | 1.0000 |
+
+结论：**light_new 的子采样统计被 heavy_slice 复现，工程上是可靠的。**
+
+### 12.4 Heavy Full 对 Light 结论的修正
+
+heavy_full 支持 light 的大方向：跨段路由高度 head-specialized，而不是均匀分布。但 heavy_full 也显示 light 采样不是穷尽的：
+
+| Mechanism | Light head | Heavy full rank | Heavy full top head | 结论 |
+|---|---|---:|---|---|
+| `X->R1` mid reference transfer | `L14/H12` | 2 | `L19/H0` | reproduced |
+| `X->R1` double reference transfer | `L4/H4` | 11 | `L19/H0` | shifted |
+| `X->P` prompt control mid | `L14/H20` | 10 | `L12/H17` | reproduced |
+| `X->P` prompt control late | `L24/H20` | 56 | `L12/H17` | shifted |
+| `S->R1` fusion | `L24/H8` | 114 | `L10/H1` | shifted |
+| `R1->S` fusion | `L24/H8` | 70 | `L10/H1` | shifted |
+| `S->X` writeback | `L24/H20` | 13 | `L5/H22` | shifted |
+| `R1->X` writeback | `L24/H12/H20` | 28 / 11 | `L5/H22` | shifted |
+
+判断：
+
+- light 的 `L14/H12 X->R1` 和 `L14/H20 X->P` 是真实关键 head，heavy_full 中仍排进 top10。
+- light 的 late fusion/writeback 结论方向正确，但没有覆盖 heavy_full 中最强的 fusion/writeback heads。
+- light 结论应定位为 **representative scout**，不是完整 sparse routing head set。
+
+### 12.5 Heavy Full 图表说明
+
+以下图已提交到仓库 `analysis_assets/compare_light_heavy_v2/figures/`。
+
+`layer_step_heatmap_*` 系列：
+
+- 横坐标：denoising step index，范围 `0-27`。
+- 纵坐标：attention layer id，`0-4` 是 double-stream，`5-24` 是 single-stream。
+- 颜色：该 edge 在该 layer/step 上对所有 heads 的平均 attention mass。
+
+![heavy X to R1 heatmap](analysis_assets/compare_light_heavy_v2/figures/layer_step_heatmap_X_to_R1.png)
+
+![heavy X to P heatmap](analysis_assets/compare_light_heavy_v2/figures/layer_step_heatmap_X_to_P.png)
+
+![heavy fusion by layer](analysis_assets/compare_light_heavy_v2/figures/fusion_edges_by_layer_full.png)
+
+`head_specialization_full.png`：
+
+- 横坐标：edge，例如 `X->S`、`X->R1`、`X->P`、`S->R1`、`R1->X`。
+- 纵坐标：layer/head 行，每行是一个 `(layer, head)`，共 25×24。
+- 颜色：该 layer/head 对该 edge 的全 step 平均 attention mass。
+
+![heavy head specialization full](analysis_assets/compare_light_heavy_v2/figures/head_specialization_full.png)
+
+`x_to_r1_by_step_full.png` / `x_to_p_by_step_full.png`：
+
+- 横坐标：denoising step index。
+- 纵坐标：全 layer/head 平均的 `X->R1` 或 `X->P` attention mass。
+
+![heavy x to r1 by step](analysis_assets/compare_light_heavy_v2/figures/x_to_r1_by_step_full.png)
+
+![heavy x to p by step](analysis_assets/compare_light_heavy_v2/figures/x_to_p_by_step_full.png)
+
+`entropy_gini_by_layer_step.png`：
+
+- 两个子图横坐标都是 denoising step，纵坐标都是 layer id。
+- 左图颜色是 normalized entropy，越低越稀疏。
+- 右图颜色是 top16 block mass，越高说明少数 blocks 吸收更多 attention。
+
+![heavy entropy top16 by layer step](analysis_assets/compare_light_heavy_v2/figures/entropy_gini_by_layer_step.png)
+
+### 12.6 Sampling Bias 与下一轮 Light 配置
+
+回答采样偏差问题：
+
+1. light 的 step `[0,14,27]` 对 heavy_full 的 early/mid/late 是代表性的，7 个核心 edge 都判定 representative。
+2. layer `[0,4,14,24]` 覆盖了 5/7 个 edge 的 top3 功能阶段，但 `X->R1` 与 `X->P` 的最强层有遗漏。
+3. heads `[0,4,8,12,16,20]` 只覆盖 3/7 个核心 edge 的 heavy top10 layer/head，fusion/writeback heads 漏得较多。
+
+推荐下一轮 light-efficient 配置：
+
+```yaml
+sample_layers: [0, 1, 2, 4, 5, 9, 10, 14, 23, 24]
+sample_heads: [0, 1, 3, 4, 8, 10, 12, 15, 16, 19, 20, 21, 22]
+sample_steps: [0, 7, 14, 21, 27]
+block_size: 256
+max_query_tokens_per_record: all
+```
+
+### 12.7 是否进入 Ablation
+
+可以进入 seed stability / causal ablation，但 ablation 目标要分两层：
+
+1. **验证 light 发现的稳定机制**：优先 ablate `L14/H12 X->R1` 和 `L14/H20 X->P`，这两个在 heavy_full 中被复现。
+2. **补充 heavy_full 发现的强 head**：对 `L19/H0 X->R1`、`L12/H17 X->P`、`L10/H1 S<->R1`、`L5/H22 R1/S->X` 做 selected ablation，否则会低估 reference transfer / prompt control / fusion writeback 的因果影响。
