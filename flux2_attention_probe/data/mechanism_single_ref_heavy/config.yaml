@@ -1,0 +1,61 @@
+# FLUX.2 Klein heavy mechanism probe — every attention layer at every denoising timestep.
+#
+# This is the expensive validation pass after the light run has identified the
+# important layers/heads. It samples:
+#   - all 25 attention modules: 5 double-stream + 20 single-stream
+#   - all denoising timesteps
+#   - all 24 heads
+#   - the full query sequence, so X/S/R/P query directions are all covered
+#
+# Keep save_full_attention=false. This config stores block-level summaries, not
+# full N x N attention tensors.
+
+backend: npu
+diffusers_src: ../diffusers/src
+output_dir: /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy
+
+# Pass source / refs / prompt through CLI for reproducibility across runs:
+#   --source "$SOURCE" --refs "$REF1" --prompt "..."
+source: null
+refs: []
+prompt: ""
+
+reference_roles:
+  R1: edit_attribute
+region_annotations: {}
+
+model:
+  model_id: /home/ma-user/work/models/FLUX.2-klein-4B
+  cache_dir: null
+  local_files_only: true
+  prefer_component_paths: false
+  dtype: bfloat16
+  offload: false
+  low_cpu_mem_usage: true
+
+local_paths:
+  flux2_tokenizer_path: /home/ma-user/work/models/FLUX.2-klein-4B/tokenizer
+  flux2_model_path: /home/ma-user/work/models/FLUX.2-klein-4B/flux-2-klein-4b.safetensors
+  flux2_text_encoder_path: /home/ma-user/work/models/FLUX.2-klein-4B/text_encoder
+  flux2_ae_path: /home/ma-user/work/models/FLUX.2-klein-4B/vae/diffusion_pytorch_model.safetensors
+
+probe:
+  save_full_attention: false
+  save_block_attention: true
+  # 256 keeps disk and CPU aggregation manageable for full layer x full step.
+  # Use 128 only when you need finer block locality and can afford the runtime.
+  block_size: 256
+  sample_layers: all
+  sample_heads: all
+  sample_steps: all
+  stream_to_disk: true
+  max_query_tokens_per_record: all
+  record_shapes: true
+
+generation:
+  height: null
+  width: null
+  max_size: 1024
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  seed: 0

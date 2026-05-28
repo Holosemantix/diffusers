@@ -1,0 +1,62 @@
+{
+  "backend": "npu",
+  "diffusers_src": "../diffusers/src",
+  "output_dir": "outputs/mechanism_single_ref_light",
+  "source": null,
+  "refs": [],
+  "prompt": "",
+  "reference_roles": {
+    "R1": "edit_attribute"
+  },
+  "region_annotations": {},
+  "model": {
+    "model_id": "/home/ma-user/work/models/FLUX.2-klein-4B",
+    "cache_dir": null,
+    "local_files_only": true,
+    "prefer_component_paths": false,
+    "dtype": "bfloat16",
+    "offload": false,
+    "low_cpu_mem_usage": true
+  },
+  "local_paths": {
+    "flux2_tokenizer_path": "/home/ma-user/work/models/FLUX.2-klein-4B/tokenizer",
+    "flux2_model_path": "/home/ma-user/work/models/FLUX.2-klein-4B/flux-2-klein-4b.safetensors",
+    "flux2_text_encoder_path": "/home/ma-user/work/models/FLUX.2-klein-4B/text_encoder",
+    "flux2_ae_path": "/home/ma-user/work/models/FLUX.2-klein-4B/vae/diffusion_pytorch_model.safetensors"
+  },
+  "probe": {
+    "save_full_attention": false,
+    "save_block_attention": true,
+    "block_size": 256,
+    "sample_layers": [
+      0,
+      4,
+      14,
+      24
+    ],
+    "sample_heads": [
+      0,
+      4,
+      8,
+      12,
+      16,
+      20
+    ],
+    "sample_steps": [
+      0,
+      14,
+      27
+    ],
+    "stream_to_disk": true,
+    "max_query_tokens_per_record": 12621,
+    "record_shapes": true
+  },
+  "generation": {
+    "height": null,
+    "width": null,
+    "max_size": 1024,
+    "num_inference_steps": 28,
+    "guidance_scale": 1.0,
+    "seed": 0
+  }
+}

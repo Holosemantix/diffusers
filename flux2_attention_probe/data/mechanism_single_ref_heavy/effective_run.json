@@ -1,0 +1,16 @@
+{
+  "max_size": 1024,
+  "target_area": 1048576,
+  "multiple_of": 16,
+  "vae_scale_factor": 8,
+  "first_image_size": [
+    2048,
+    3072
+  ],
+  "scale": 0.408248290463863,
+  "rule": "scale_down_to_max_size",
+  "height_in": null,
+  "width_in": null,
+  "height_out": 1248,
+  "width_out": 832
+}

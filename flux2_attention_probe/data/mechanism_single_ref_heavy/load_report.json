@@ -1,0 +1,17 @@
+{
+  "model_id": "/home/ma-user/work/models/FLUX.2-klein-4B",
+  "warnings": [],
+  "torch_dtype": "bfloat16",
+  "offload_enabled": false,
+  "load_errors": [],
+  "components": {
+    "vae": "AutoencoderKLFlux2",
+    "text_encoder": "Qwen3ForCausalLM",
+    "tokenizer": "Qwen2TokenizerFast",
+    "scheduler": "FlowMatchEulerDiscreteScheduler",
+    "transformer": "Flux2Transformer2DModel"
+  },
+  "transformer_path": "transformer",
+  "transformer_class": "Flux2Transformer2DModel",
+  "possible_transformer_modules": []
+}
