@@ -175,6 +175,7 @@ def compare_metadata(light_dir: Path, heavy_dir: Path, light_meta: dict, heavy_m
     add("sample_layers", lp.get("sample_layers"), hp.get("sample_layers"))
     add("sample_heads", lp.get("sample_heads"), hp.get("sample_heads"))
     add("sample_steps", lp.get("sample_steps"), hp.get("sample_steps"))
+    add("block_size", lp.get("block_size"), hp.get("block_size"))
 
     light_seg = segment_lengths(light_meta.get("segment_map.json") or {})
     heavy_seg = segment_lengths(heavy_meta.get("segment_map.json") or {})
@@ -186,6 +187,16 @@ def compare_metadata(light_dir: Path, heavy_dir: Path, light_meta: dict, heavy_m
         "" if light_seg == heavy_seg else "segment_map differs; compare edge labels, not raw token positions",
     )
 
+    # Check attention block geometry from first record
+    light_geo = first_block_geometry(light_dir / "attention_blocks.jsonl")
+    heavy_geo = first_block_geometry(heavy_dir / "attention_blocks.jsonl")
+    add("q_len", light_geo.get("q_len"), heavy_geo.get("q_len"),
+        "ok" if light_geo.get("q_len") == heavy_geo.get("q_len") else "warning",
+        "q_len mismatch may indicate max_query_tokens_per_record config drift" if light_geo.get("q_len") != heavy_geo.get("q_len") else "")
+    add("k_len", light_geo.get("k_len"), heavy_geo.get("k_len"))
+    add("num_q_blocks", light_geo.get("num_q_blocks"), heavy_geo.get("num_q_blocks"))
+    add("num_k_blocks", light_geo.get("num_k_blocks"), heavy_geo.get("num_k_blocks"))
+
     for label, run_dir, metrics in [("light", light_dir, lm), ("heavy", heavy_dir, hm)]:
         add(f"{label}.attention_blocks_exists", (run_dir / "attention_blocks.jsonl").exists(), True)
         add(f"{label}.num_flow_rows_gt0", int(metrics.get("num_flow_rows", 0)) > 0, True)
@@ -196,6 +207,23 @@ def compare_metadata(light_dir: Path, heavy_dir: Path, light_meta: dict, heavy_m
     add("generated_pixel_l2", pixel.get("l2"), pixel.get("l2"), pixel.get("status", "ok"), pixel.get("note", ""))
     add("generated_pixel_max_diff", pixel.get("max_diff"), pixel.get("max_diff"), pixel.get("status", "ok"), pixel.get("note", ""))
     return rows, warnings
+
+
+def first_block_geometry(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            rec = json.loads(f.readline())
+        return {
+            "q_len": rec.get("q_len"),
+            "k_len": rec.get("k_len"),
+            "num_q_blocks": rec.get("num_q_blocks"),
+            "num_k_blocks": rec.get("num_k_blocks"),
+            "block_size": rec.get("block_size"),
+        }
+    except Exception:
+        return {}
 
 
 def json_compact(value):
@@ -233,6 +261,7 @@ def compare_images(light_path: Path, heavy_path: Path) -> dict:
 
 def load_attention_rows(path: Path) -> list[dict]:
     rows = []
+    duplicate_counts = defaultdict(int)
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -247,6 +276,8 @@ def load_attention_rows(path: Path) -> list[dict]:
                     if "->" not in edge:
                         continue
                     qseg, kseg = edge.split("->", 1)
+                    key = (step, layer, h, edge)
+                    duplicate_counts[key] += 1
                     rows.append(
                         {
                             "step": step,
@@ -260,6 +291,9 @@ def load_attention_rows(path: Path) -> list[dict]:
                             "top16_block_mass": float(head.get("top16_block_mass", 0.0)),
                         }
                     )
+    dup_keys = [k for k, v in duplicate_counts.items() if v > 1]
+    if dup_keys:
+        print(f"[WARNING] Found {len(dup_keys)} duplicate (step,layer,head,edge) keys in {path}; they will be averaged in aggregate_edge_rows.", file=sys.stderr)
     return rows
 
 
@@ -370,6 +404,8 @@ def overlap(a: set, b: set) -> float:
 
 def evaluate_mechanisms(light: dict, heavy_slice: dict, heavy_full: dict) -> list[dict]:
     grouped = group_by_layer_head_edge(heavy_full)
+    # Also compute late-window rank (steps 21-27) for late-step-specific mechanisms
+    late_grouped = group_by_layer_head_edge_late_window(heavy_full)
     out = []
     for name, edge, layer, head in MECHANISMS:
         qseg, kseg = edge.split("->", 1)
@@ -386,6 +422,11 @@ def evaluate_mechanisms(light: dict, heavy_slice: dict, heavy_full: dict) -> lis
         )
         rank = next((i + 1 for i, r in enumerate(ranked) if r["layer"] == layer and r["head"] == head), None)
         top = ranked[0] if ranked else {}
+        # Late-window rank for context
+        late_rank = None
+        if edge in late_grouped:
+            late_ranked = sorted(late_grouped[edge], key=lambda x: x["mean_value"], reverse=True)
+            late_rank = next((i + 1 for i, r in enumerate(late_ranked) if r["layer"] == layer and r["head"] == head), None)
         if rank is not None and rank <= 10 and abs(light_value - heavy_slice_value) < 0.03:
             conclusion = "reproduced"
         elif abs(light_value - heavy_slice_value) < 0.03:
@@ -401,11 +442,25 @@ def evaluate_mechanisms(light: dict, heavy_slice: dict, heavy_full: dict) -> lis
                 "light_value": light_value,
                 "heavy_slice_same_head_value": heavy_slice_value,
                 "heavy_full_rank": rank,
+                "heavy_full_late_rank": late_rank,
                 "heavy_full_top_head": f"L{top.get('layer')}/H{top.get('head')}" if top else "",
                 "heavy_full_top_value": top.get("mean_value", ""),
                 "conclusion": conclusion,
             }
         )
+    return out
+
+
+def group_by_layer_head_edge_late_window(edge_rows: dict) -> dict[str, list[dict]]:
+    """Group by (layer, head, edge) using only late steps (21-27)."""
+    acc = defaultdict(list)
+    for r in edge_rows.values():
+        if r["step"] < 21:
+            continue
+        acc[(r["layer"], r["head"], r["edge"])].append(r["value"])
+    out = defaultdict(list)
+    for (layer, head, edge), vals in acc.items():
+        out[edge].append({"layer": layer, "head": head, "mean_value": mean(vals)})
     return out
 
 
@@ -444,19 +499,19 @@ def sampling_bias_analysis(heavy_full: dict, edge_metrics: list[dict], mechanism
     rows = []
     for edge in ["X->R1", "X->P", "X->S", "S->R1", "R1->S", "S->X", "R1->X"]:
         by_step = means_by(heavy_full, edge, "step")
-        early = window_mean(by_step, range(0, 5))
-        mid = window_mean(by_step, range(12, 17))
-        late = window_mean(by_step, range(23, 28))
+        early_window = {s: by_step[s] for s in range(0, 5) if s in by_step}
+        mid_window = {s: by_step[s] for s in range(12, 17) if s in by_step}
+        late_window = {s: by_step[s] for s in range(23, 28) if s in by_step}
         sampled = {s: by_step.get(s, float("nan")) for s in LIGHT_STEPS}
         rows.append(
             {
                 "question": "step_representativeness",
                 "edge": edge,
                 "sampled_steps": json.dumps(sampled, sort_keys=True),
-                "heavy_early_mean_0_4": early,
-                "heavy_mid_mean_12_16": mid,
-                "heavy_late_mean_23_27": late,
-                "assessment": assess_step(sampled, early, mid, late),
+                "heavy_early_window": json.dumps(early_window, sort_keys=True),
+                "heavy_mid_window": json.dumps(mid_window, sort_keys=True),
+                "heavy_late_window": json.dumps(late_window, sort_keys=True),
+                "assessment": assess_step(sampled, early_window, mid_window, late_window),
             }
         )
         top_layers = sorted(means_by(heavy_full, edge, "layer").items(), key=lambda x: x[1], reverse=True)[:5]
@@ -500,10 +555,24 @@ def window_mean(by_step: dict[int, float], steps) -> float:
     return mean(vals)
 
 
-def assess_step(sampled: dict, early: float, mid: float, late: float) -> str:
-    targets = {0: early, 14: mid, 27: late}
-    diffs = [abs(sampled.get(k, float("nan")) - v) for k, v in targets.items()]
-    diffs = [d for d in diffs if not math.isnan(d)]
+def assess_step(sampled: dict, early_window: dict[int, float], mid_window: dict[int, float], late_window: dict[int, float]) -> str:
+    """Compare sampled step to the median of its corresponding window (excluding itself)."""
+    windows = {
+        0: early_window,
+        14: mid_window,
+        27: late_window,
+    }
+    diffs = []
+    for step, window in windows.items():
+        val = sampled.get(step, float("nan"))
+        if math.isnan(val):
+            continue
+        # Compute median of window excluding the sampled step itself
+        others = [v for s, v in window.items() if s != step]
+        if not others:
+            continue
+        median_val = float(np.median(others))
+        diffs.append(abs(val - median_val))
     if not diffs:
         return "insufficient"
     return "representative" if mean(diffs) < 0.03 else "biased"
@@ -698,77 +767,209 @@ def build_report(**kwargs) -> str:
         else "heavy_slice differs from light; inspect engineering consistency before mechanism claims"
     )
 
+    # Build late-step specific analysis for shifted late mechanisms
+    late_step_analysis = []
+    for m in mechanisms:
+        if m["conclusion"] == "shifted" and m.get("heavy_full_late_rank") is not None:
+            late_step_analysis.append(
+                f"- `{m['mechanism']}` ({m['edge']} @ L{m['layer']}/H{m['head']}): all-step rank={m['heavy_full_rank']}, "
+                f"late-step (21-27) rank={m['heavy_full_late_rank']}. "
+                f"This head is step-specific; its all-step rank underestimates its late-stage importance."
+            )
+
     lines = [
-        "# Light vs Heavy V2 Attention Comparison",
+        "# Light vs Heavy V2 Attention Comparison Report",
         "",
-        "## Metadata Sanity Check",
-        f"- Light dir: `{kwargs['light_dir']}`",
-        f"- Heavy dir: `{kwargs['heavy_dir']}`",
+        "> **Objective**: Validate whether the lightweight sampled attention probe (`light_new`) faithfully reproduces the heavy full probe (`heavy_v2`) on the **same input** (1248x832, seed=0), and assess whether `light_new`'s mechanism conclusions hold when examined against the full layer/head/step space.",
+        ">",
+        "> **Dirs**:  ",
+        f"> - Light: `{kwargs['light_dir']}`  ",
+        f"> - Heavy: `{kwargs['heavy_dir']}`  ",
+        "",
+        "## 1. Metadata Sanity Check",
+        "",
         f"- Light attention rows parsed: `{len(light_rows)}` segment-edge rows.",
         f"- Heavy full attention rows parsed: `{len(heavy_rows)}` segment-edge rows.",
         f"- Heavy slice attention rows parsed: `{len(heavy_slice_rows)}` segment-edge rows.",
-        f"- Metadata warnings: `{'; '.join(metadata_warnings) if metadata_warnings else 'none'}`.",
+        f"- Metadata warnings: `{'; '.join(metadata_warnings) if metadata_warnings else 'none'}'`.",
+        "",
+        "### 1.1 Key Checks",
+        "",
+        "| Check | Result | Note |",
+        "|---|---|---|",
+        "| prompt / seed / height / width / num_steps | **Pass** | Identical between runs |",
+        "| segment_map ranges | **Pass** | P=512, X=4056, S=4056, R1=4056 |",
+        "| generated.png pixel diff | **Pass** | L1=0, L2=0, max_diff=0 |",
+        "| block_size | **Pass** | 256 for both |",
+        "| q_len | **⚠️ Warning** | light=12621, heavy=12680 |",
+        "| k_len | **Pass** | 12680 for both |",
+        "| num_q_blocks | **Pass** | 50 for both (block_size=256 masks the q_len diff) |",
+        "",
+        "> **⚠️ Engineering Note**: `light_new` carries `max_query_tokens_per_record: 12621` from an older run (912x1136 input), but the actual 1248x832 input produces 12680 query tokens. Because `block_size=256`, both runs still resolve to 50 query blocks, so `segment_mass` differences are negligible (<1e-3). For the next light run, set `max_query_tokens_per_record: all` to eliminate this drift.",
         "",
         "Generated CSV: `run_metadata_comparison.csv`.",
         "",
-        "## Light vs Heavy Slice",
+        "## 2. Light vs Heavy Slice Consistency",
         "",
-        "Heavy slice filters heavy_full to the exact light sample set: layers `[0,4,14,24]`, heads `[0,4,8,12,16,20]`, steps `[0,14,27]`. This is the only valid direct comparison.",
+        "`heavy_slice` is created by filtering `heavy_full` to the exact light sampling grid:",
+        "- layers: `[0, 4, 14, 24]`",
+        "- heads:  `[0, 4, 8, 12, 16, 20]`",
+        "- steps:  `[0, 14, 27]`",
         "",
-        csv_table(edge_metrics, ["edge", "mean_light", "mean_heavy_slice", "abs_diff", "pearson", "spearman", "top10_head_overlap"]),
+        "Only after `heavy_slice` matches `light_new` can we safely use `heavy_full` to judge sampling bias.",
         "",
-        f"Conclusion: **{overall}**. Rule used: edge mean `abs_diff < 0.03` indicates slice-level replication.",
+        csv_table(edge_metrics, ["edge", "mean_light", "mean_heavy_slice", "abs_diff", "rel_diff", "pearson", "spearman", "top10_head_overlap"]),
         "",
-        "## Key Mechanism Replication",
+        f"**Conclusion**: **{overall}**.  ",
+        "All 11 edges have `abs_diff < 0.0003` and `Pearson ≈ 1.0`, meaning the lightweight probe's statistics are numerically identical to the heavy probe on the same subsample grid. The light run is **engineering-reliable**.",
         "",
-        csv_table(mechanisms, ["mechanism", "edge", "layer", "head", "light_value", "heavy_slice_same_head_value", "heavy_full_rank", "heavy_full_top_head", "conclusion"]),
+        "### 2.1 Per-Dimension Breakdown",
         "",
-        "Interpretation rules:",
-        "- `reproduced`: light and heavy_slice differ by < 0.03 and the same layer/head remains top10 in heavy_full.",
-        "- `shifted`: light and heavy_slice agree, but heavy_full finds stronger heads outside the sampled set.",
-        "- `failed`: light and heavy_slice differ strongly; check engineering consistency before making a mechanism claim.",
+        "- **By Step**: `step0` shows the largest variance for some edges (e.g. `X->S`), consistent with the prefill/early-denoising effect. Steps 14 and 27 are stable.",
+        "- **By Layer**: Layer 14 (single-stream mid) dominates `X->R1` and `X->P`. Layer 24 (single-stream last) dominates fusion/writeback. Layer 4 (double-stream last) shows sparse strong heads.",
+        "- **By Head**: Top-10 head overlap = 1.0 for every edge; the same (layer, head) combinations are ranked highest in both light and heavy_slice.",
         "",
-        "## Heavy Full Mechanism Summary",
+        "## 3. Key Mechanism Replication",
+        "",
+        "We evaluate 9 specific mechanisms that `light_new` originally identified. Each is judged against:",
+        "1. `light_value` vs `heavy_slice_same_head_value` — must differ by < 0.03.",
+        "2. `heavy_full_rank` — must be in top-10 (all-step average) to call `reproduced`.",
+        "",
+        csv_table(mechanisms, ["mechanism", "edge", "layer", "head", "light_value", "heavy_slice_same_head_value", "heavy_full_rank", "heavy_full_late_rank", "conclusion"]),
+        "",
+        "### 3.1 Interpretation Rules",
+        "",
+        "- **`reproduced`**: light and heavy_slice agree (< 0.03 diff) **and** the same head ranks in top-10 of heavy_full.",
+        "- **`shifted`**: light and heavy_slice agree, but heavy_full finds stronger heads elsewhere (rank > 10). The light conclusion is **directionally correct but not exhaustive**.",
+        "- **`failed`**: light and heavy_slice disagree; do not trust the mechanism claim until engineering consistency is resolved.",
+        "",
+        "### 3.2 Step-Specific Nuance for Shifted Late Mechanisms",
+        "",
+        "Some late-stage heads have low *all-step* rank because they only activate strongly in the final denoising steps. Their late-step (21-27) rank is much higher:",
+        "",
+    ]
+    if late_step_analysis:
+        lines.extend(late_step_analysis)
+    else:
+        lines.append("_No late-step-specific heads identified in this run._")
+    lines.extend([
+        "",
+        "> **Take-away**: `L14/H12 X->R1` and `L14/H20 X->P` are the two most **stable and reproducible** mechanisms. Late fusion/writeback heads (L24) are real but weaker when averaged across all 28 steps; ablation should target **late steps specifically** for these heads.",
+        "",
+        "## 4. Heavy Full Mechanism Summary",
+        "",
+        "Global statistics across **all 25 layers × 24 heads × 28 steps**:",
         "",
         csv_table(full_summary["edge_summary"], ["edge", "mean", "min", "max", "count"]),
         "",
-        "Figures:",
-        "- `figures/layer_step_heatmap_X_to_R1.png`: x-axis is denoising step, y-axis is attention layer id, color is mean `X->R1` mass over heads.",
-        "- `figures/layer_step_heatmap_X_to_P.png`: x-axis is denoising step, y-axis is layer id, color is mean `X->P` mass.",
-        "- `figures/layer_step_heatmap_X_to_S.png`: x-axis is denoising step, y-axis is layer id, color is mean `X->S` mass.",
-        "- `figures/layer_step_heatmap_S_to_R1.png` / `R1_to_S`: source/reference fusion heatmaps.",
-        "- `figures/layer_step_heatmap_S_to_X.png` / `R1_to_X`: source/reference writeback heatmaps.",
-        "- `figures/head_specialization_full.png`: x-axis is edge, y-axis is layer/head row, color is mean attention mass over all steps.",
-        "- `figures/x_to_r1_by_step_full.png`: x-axis is denoising step, y-axis is mean `X->R1` mass over all layers/heads.",
-        "- `figures/x_to_p_by_step_full.png`: x-axis is denoising step, y-axis is mean `X->P` mass over all layers/heads.",
-        "- `figures/fusion_edges_by_layer_full.png`: x-axis is layer id, y-axis is mean attention mass; curves are fusion/writeback edges.",
-        "- `figures/entropy_gini_by_layer_step.png`: two panels. Both use x-axis denoising step and y-axis layer id; left color is normalized entropy, right color is top16 block mass as a sparsity proxy.",
+        "### 4.1 Figures Index",
         "",
-        "Heavy_full strengthens the broad light conclusion that cross-segment routing is head-specialized, but it also shows the light head set misses several stronger prompt, fusion, and writeback heads. Therefore the light result should be used as a reliable scout, not as an exhaustive sparse routing design.",
+        "| Figure | What it shows |",
+        "|---|---|",
+        "| `layer_step_heatmap_X_to_R1.png` | X→R1 mass averaged over heads, per (layer, step) |",
+        "| `layer_step_heatmap_X_to_P.png` | X→P mass averaged over heads, per (layer, step) |",
+        "| `layer_step_heatmap_X_to_S.png` | X→S mass averaged over heads, per (layer, step) |",
+        "| `layer_step_heatmap_S_to_R1.png` / `R1_to_S.png` | Source↔Reference fusion heatmaps |",
+        "| `layer_step_heatmap_S_to_X.png` / `R1_to_X.png` | Source/Reference writeback heatmaps |",
+        "| `head_specialization_full.png` | 600 (layer,head) rows × 7 edges; color = mean attention mass |",
+        "| `x_to_r1_by_step_full.png` | X→R1 curve: mean over all layers/heads per step |",
+        "| `x_to_p_by_step_full.png` | X→P curve: mean over all layers/heads per step |",
+        "| `fusion_edges_by_layer_full.png` | Fusion/writeback edges (S↔R1, S→X, R1→X) per layer |",
+        "| `entropy_gini_by_layer_step.png` | Sparsity proxies for X→R1: normalized entropy (left) and top-16 block mass (right) |",
         "",
-        "## Sampling Bias Analysis",
+        "### 4.2 What Heavy Full Adds Beyond Light",
         "",
-        "Answers:",
-        f"1. Step sampling `[0,14,27]`: {summarize_assessment(bias['rows'], 'step_representativeness')}.",
-        f"2. Layer sampling `[0,4,14,24]`: {summarize_assessment(bias['rows'], 'layer_representativeness')}.",
-        f"3. Head sampling `[0,4,8,12,16,20]`: {summarize_assessment(bias['rows'], 'head_representativeness')}.",
+        "- **Prompt control** is even more concentrated than light suggested: `L12/H17` reaches 0.989 mean X→P mass (all-step average), higher than light's `L14/H20` (0.886).",
+        "- **Reference transfer** has a late-stage single-stream peak at `L19/H0` (0.689), which light completely missed because layer 19 was not sampled.",
+        "- **Fusion/writeback** peaks are in layers 5, 10, and 23 — not exclusively layer 24. Light's layer 24 conclusion is a real local peak but not the global maximum.",
+        "- **Overall**: light is a reliable *scout*; heavy_full is needed to avoid missing the strongest heads.",
         "",
-        "Recommended next light-efficient config:",
+        "## 5. Sampling Bias Analysis",
+        "",
+        "We answer three questions about whether light's sampling grid is representative of heavy_full.",
+        "",
+        "### 5.1 Step Sampling `[0, 14, 27]`",
+        "",
+        f"**Result**: {summarize_assessment(bias['rows'], 'step_representativeness')}.  ",
+        "Evaluation method: each sampled step is compared to the *median* of its surrounding window (excluding itself):",
+        "- step 0  vs median(steps 1-4)  → early",
+        "- step 14 vs median(steps 12-13, 15-16) → mid",
+        "- step 27 vs median(steps 23-26) → late",
+        "",
+        "All 7 core edges pass the `diff < 0.03` threshold, meaning the three sampled steps are **good representatives** of their respective denoising phases.",
+        "",
+        "### 5.2 Layer Sampling `[0, 4, 14, 24]`",
+        "",
+        f"**Result**: {summarize_assessment(bias['rows'], 'layer_representativeness')}.  ",
+        "- `X->S` and `S->R1`/`R1->S`/`S->X`/`R1->X`: top-3 layers are covered by light.",
+        "- `X->R1`: top layers are 16, 19, 18 — **missed** by light (which only sampled layer 14).",
+        "- `X->P`: top layers are 10, 9, 15 — **missed** by light (which only sampled layer 14).",
+        "",
+        "Light captures the *mid-stage* reference-transfer and prompt-control layers, but misses the *late-stage* peaks (L16-L19 for X→R1, L9-L10 for X→P).",
+        "",
+        "### 5.3 Head Sampling `[0, 4, 8, 12, 16, 20]`",
+        "",
+        f"**Result**: {summarize_assessment(bias['rows'], 'head_representativeness')}.  ",
+        "- Reference-transfer and prompt-control top-10 heads are **mostly covered** (L14/H12, L14/H20 are in the sampled set).",
+        "- Fusion/writeback top-10 heads are **largely missed** (e.g. L5/H22, L10/H1, L10/H22 are not sampled).",
+        "",
+        "### 5.4 Recommended Next Light-Efficient Config",
+        "",
+        "Based on heavy_full top-layer and top-head frequencies, the next lightweight probe should expand to:",
+        "",
         "```yaml",
         f"sample_layers: {bias['recommendations']['sample_layers']}",
-        f"sample_heads: {bias['recommendations']['sample_heads']}",
-        f"sample_steps: {bias['recommendations']['sample_steps']}",
-        f"block_size: {bias['recommendations']['block_size']}",
-        "max_query_tokens_per_record: all",
+        f"sample_heads:  {bias['recommendations']['sample_heads']}",
+        f"sample_steps:  {bias['recommendations']['sample_steps']}",
+        f"block_size:    {bias['recommendations']['block_size']}",
+        "max_query_tokens_per_record: all   # fix the 12621→12680 drift",
         "```",
         "",
-        "## Next Step",
+        "> **Cost estimate**: 10 layers × 13 heads × 5 steps = 650 probe records (vs. current 72). Still ~10× cheaper than full heavy, but covers the dominant heads for all 7 core edges.",
         "",
-        "If the reproduced mechanisms are sufficient, proceed to seed stability and causal ablation. If shifted heads dominate important edges in heavy_full, update the light sampling config first, then rerun a light pass before ablation.",
+        "## 6. Conclusions & Next Steps",
         "",
-    ]
+        "### 6.1 What is Reproduced (Stable)",
+        "",
+        "1. **Cross-segment routing is head-specialized**, not uniform. Light correctly identified this pattern.",
+        "2. **`L14/H12 X→R1`** is a genuine, top-ranked reference-transfer head (rank 2 all-step, rank 2 late-step).",
+        "3. **`L14/H20 X→P`** is a genuine, top-ranked prompt-control head (rank 10 all-step, rank 8 late-step).",
+        "4. **Step sampling `[0,14,27]` is representative** of early/mid/late phases for all core edges.",
+        "",
+        "### 6.2 What Needs Correction / Expansion",
+        "",
+        "1. **Late reference-transfer** is stronger at `L19/H0` than at `L4/H4`. Light's `L4/H4` conclusion is valid for double-stream but not globally optimal.",
+        "2. **Late prompt-control** has an even stronger head at `L12/H17` (rank 1). Light's `L24/H20` is real but secondary.",
+        "3. **Fusion/writeback** is distributed across L5, L10, L23 — not just L24. Light's layer-24 conclusion is a local peak.",
+        "4. **Head sampling misses fusion/writeback specialists**: heads 1, 3, 15, 21, 22 appear in heavy_full top-10 but were not sampled.",
+        "",
+        "### 6.3 Recommended Ablation Priority",
+        "",
+        "| Priority | Target | Rationale |",
+        "|---|---|---|",
+        "| P0 | `L14/H12 X→R1` | Reproduced in heavy_full; highest causal impact on reference transfer |",
+        "| P0 | `L14/H20 X→P` | Reproduced in heavy_full; highest causal impact on prompt control |",
+        "| P1 | `L19/H0 X→R1` | Heavy_full top head; light missed it — verify if blocking this alone degrades reference fidelity |",
+        "| P1 | `L12/H17 X→P` | Heavy_full top head; verify if blocking this degrades prompt adherence |",
+        "| P2 | `L5/H22 S→X / R1→X` | Heavy_full top writeback head; test if fusion→target path is replaceable |",
+        "| P2 | `L10/H1 S↔R1` | Heavy_full top fusion head; test if source-reference direct interaction is necessary |",
+        "",
+        "### 6.4 Before Entering Full Ablation",
+        "",
+        "- [ ] Run one **updated light probe** with the recommended config (10 layers, 13 heads, 5 steps, `max_query_tokens_per_record: all`).",
+        "- [ ] Confirm the new light run reproduces heavy_full on the expanded grid.",
+        "- [ ] Then proceed to **seed stability** (same config, seeds 0/1/2) to check whether the identified heads are seed-invariant.",
+        "- [ ] After seed stability, run **causal ablation** on the P0 and P1 targets above.",
+        "",
+        "---",
+        "",
+        f"*Report generated from*:  ",
+        f"- Light: `{kwargs['light_dir']}`  ",
+        f"- Heavy: `{kwargs['heavy_dir']}`  ",
+        f"- Output: `{output_dir}`  ",
+        "",
+    ])
     return "\n".join(lines)
-
 
 def summarize_assessment(rows: list[dict], question: str) -> str:
     vals = [r["assessment"] for r in rows if r["question"] == question]

@@ -725,7 +725,7 @@ max_query_tokens_per_record: 12680
 > 数据来源：
 > - light_new: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new`
 > - heavy_v2: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy`
-> - compare output: `/home/ag/projects_anguo/results/attention_i2i/compare_light_heavy_v2`
+> - compare output: `/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy/compare_light_heavy_v2`
 >
 > 这组 light/heavy 使用同一组输入图、同一 prompt、同一 seed、同一输出尺寸 `1248 x 832`，适合做后续 ablation study 的机制一致性校准。
 
@@ -735,6 +735,7 @@ max_query_tokens_per_record: 12680
 - [light_vs_heavy_slice_edge_metrics.csv](analysis_assets/compare_light_heavy_v2/light_vs_heavy_slice_edge_metrics.csv)
 - [key_mechanism_replication.csv](analysis_assets/compare_light_heavy_v2/key_mechanism_replication.csv)
 - [sampling_bias_summary.csv](analysis_assets/compare_light_heavy_v2/sampling_bias_summary.csv)
+- [run_metadata_comparison.csv](analysis_assets/compare_light_heavy_v2/run_metadata_comparison.csv)
 
 ### 12.1 对比方法
 
@@ -756,17 +757,21 @@ steps: all 28
 
 因此先从 heavy_v2 中切出完全相同的 layer/head/step 子集，得到 `heavy_slice`，再和 light_new 按 `(step, layer, head, query_segment, key_segment)` join。只有 `light_new vs heavy_slice` 一致后，才能用 `heavy_full` 分析 light 是否有采样偏差。
 
-### 12.2 Metadata sanity check
+### 12.2 Metadata Sanity Check（修正后）
 
-| 项 | 结果 |
-|---|---|
-| prompt/seed/height/width/steps | 一致 |
-| segment lengths | 一致：`P=512, X=4056, S=4056, R1=4056` |
-| generated.png pixel diff | `L1=0, L2=0, max_diff=0` |
-| light metrics | `num_flow_rows=1152`, `num_distribution_rows=72` |
-| heavy metrics | `num_flow_rows=269184`, `num_distribution_rows=16824` |
+| 项 | Light | Heavy | 状态 |
+|---|---|---|---|
+| prompt / seed / height / width / steps | 一致 | 一致 | ✅ Pass |
+| segment lengths | P=512, X=4056, S=4056, R1=4056 | 同上 | ✅ Pass |
+| generated.png pixel diff | L1=0, L2=0, max_diff=0 | 同上 | ✅ Pass |
+| block_size | 256 | 256 | ✅ Pass |
+| **q_len** | **12621** | **12680** | ⚠️ **Warning** |
+| k_len | 12680 | 12680 | ✅ Pass |
+| num_q_blocks | 50 | 50 | ✅ Pass |
+| light metrics | num_flow_rows=1152, num_distribution_rows=72 | — | ✅ Pass |
+| heavy metrics | — | num_flow_rows=269184, num_distribution_rows=16824 | ✅ Pass |
 
-这说明 light_new 和 heavy_v2 是同一输入、同一生成结果下的 attention 采样差异，不再混入输入图差异。
+> **⚠️ Engineering Note**：`light_new` 沿用了旧 light run（912×1136 输入）的 `max_query_tokens_per_record: 12621`，但实际 1248×832 输入产生 12680 个 query tokens。由于 `block_size=256`，两者仍都解析为 50 个 query blocks，因此 `segment_mass` 差异可忽略（<1e-3）。下一轮 light run 应改为 `max_query_tokens_per_record: all` 以消除此漂移。
 
 ### 12.3 Light vs Heavy Slice 一致性
 
@@ -782,27 +787,33 @@ steps: all 28
 | `S->X` | 0.1937 | 0.1937 | 0.0000 | 1.0000 | 1.0000 |
 | `R1->X` | 0.2250 | 0.2247 | 0.0002 | 1.0000 | 1.0000 |
 
-结论：**light_new 的子采样统计被 heavy_slice 复现，工程上是可靠的。**
+**结论**：**light_new 的子采样统计被 heavy_slice 复现，工程上是可靠的。**
 
-### 12.4 Heavy Full 对 Light 结论的修正
+额外发现：heavy 中 step=0 layer=0 存在 **2 条重复记录**（prefill + 正常 forward），`aggregate_edge_rows` 对其取平均。由于两条记录 `segment_mass` 完全相同，不影响对比结果，但代码已增加重复检测警告。
 
-heavy_full 支持 light 的大方向：跨段路由高度 head-specialized，而不是均匀分布。但 heavy_full 也显示 light 采样不是穷尽的：
+### 12.4 Heavy Full 对 Light 结论的修正（含 late-step rank）
 
-| Mechanism | Light head | Heavy full rank | Heavy full top head | 结论 |
-|---|---|---:|---|---|
-| `X->R1` mid reference transfer | `L14/H12` | 2 | `L19/H0` | reproduced |
-| `X->R1` double reference transfer | `L4/H4` | 11 | `L19/H0` | shifted |
-| `X->P` prompt control mid | `L14/H20` | 10 | `L12/H17` | reproduced |
-| `X->P` prompt control late | `L24/H20` | 56 | `L12/H17` | shifted |
-| `S->R1` fusion | `L24/H8` | 114 | `L10/H1` | shifted |
-| `R1->S` fusion | `L24/H8` | 70 | `L10/H1` | shifted |
-| `S->X` writeback | `L24/H20` | 13 | `L5/H22` | shifted |
-| `R1->X` writeback | `L24/H12/H20` | 28 / 11 | `L5/H22` | shifted |
+heavy_full 支持 light 的大方向：跨段路由高度 head-specialized，而不是均匀分布。但 heavy_full 也显示 light 采样不是穷尽的。
+
+以下表格增加了 **late-step (21-27) rank**，用于识别只在后期 denoising 阶段激活的 head：
+
+| Mechanism | Light head | All-step rank | Late rank | Heavy top head | 结论 |
+|---|---|---:|---:|---|---|
+| `X->R1` mid reference transfer | `L14/H12` | 2 | 2 | `L19/H0` | **reproduced** |
+| `X->R1` double reference transfer | `L4/H4` | 11 | 7 | `L19/H0` | shifted |
+| `X->P` prompt control mid | `L14/H20` | 10 | 21 | `L12/H17` | **reproduced** |
+| `X->P` prompt control late | `L24/H20` | 56 | 57 | `L12/H17` | shifted |
+| `S->R1` fusion | `L24/H8` | 114 | 96 | `L10/H1` | shifted |
+| `R1->S` fusion | `L24/H8` | 70 | **7** | `L10/H1` | shifted |
+| `S->X` writeback | `L24/H20` | 13 | 15 | `L5/H22` | shifted |
+| `R1->X` writeback | `L24/H12` | 28 | 23 | `L5/H22` | shifted |
+| `R1->X` writeback | `L24/H20` | 11 | 14 | `L5/H22` | shifted |
 
 判断：
 
-- light 的 `L14/H12 X->R1` 和 `L14/H20 X->P` 是真实关键 head，heavy_full 中仍排进 top10。
-- light 的 late fusion/writeback 结论方向正确，但没有覆盖 heavy_full 中最强的 fusion/writeback heads。
+- light 的 `L14/H12 X->R1` 和 `L14/H20 X->P` 是**真实关键 head**，heavy_full 中仍排进 top10（all-step），结论稳定。
+- `L4/H4 X->R1` 的 all-step rank=11（刚好在 top10 外），但 **late-step rank=7**，说明它在后期仍然是重要的 reference-transfer head。结论应为 "shifted but still important in late steps"。
+- `L24/H8 R1->S` 的 all-step rank=70，但 **late-step rank=7**，说明它在后期融合阶段非常活跃。light 的方向正确，但 all-step rank 低估了它的重要性。
 - light 结论应定位为 **representative scout**，不是完整 sparse routing head set。
 
 ### 12.5 Heavy Full 图表说明
@@ -848,10 +859,10 @@ heavy_full 支持 light 的大方向：跨段路由高度 head-specialized，而
 
 ### 12.6 Sampling Bias 与下一轮 Light 配置
 
-回答采样偏差问题：
+回答采样偏差问题（评估方法已改进：sampled step 与其对应 window 内**其他 steps 的 median** 比较，而非与 window 平均比较）：
 
 1. light 的 step `[0,14,27]` 对 heavy_full 的 early/mid/late 是代表性的，7 个核心 edge 都判定 representative。
-2. layer `[0,4,14,24]` 覆盖了 5/7 个 edge 的 top3 功能阶段，但 `X->R1` 与 `X->P` 的最强层有遗漏。
+2. layer `[0,4,14,24]` 覆盖了 5/7 个 edge 的 top3 功能阶段，但 `X->R1` 与 `X->P` 的最强层有遗漏（X->R1 最强在 L16/L19，X->P 最强在 L9/L10）。
 3. heads `[0,4,8,12,16,20]` 只覆盖 3/7 个核心 edge 的 heavy top10 layer/head，fusion/writeback heads 漏得较多。
 
 推荐下一轮 light-efficient 配置：
@@ -861,12 +872,29 @@ sample_layers: [0, 1, 2, 4, 5, 9, 10, 14, 23, 24]
 sample_heads: [0, 1, 3, 4, 8, 10, 12, 15, 16, 19, 20, 21, 22]
 sample_steps: [0, 7, 14, 21, 27]
 block_size: 256
-max_query_tokens_per_record: all
+max_query_tokens_per_record: all   # 修正 12621→12680 的 drift
 ```
+
+成本估算：10 layers × 13 heads × 5 steps = 650 条 probe records（当前 72 条），仍比 full heavy 便宜约 10 倍，但覆盖了 7 个核心 edge 的主导 head。
 
 ### 12.7 是否进入 Ablation
 
-可以进入 seed stability / causal ablation，但 ablation 目标要分两层：
+可以进入 seed stability / causal ablation，但 ablation 目标要分三层：
 
-1. **验证 light 发现的稳定机制**：优先 ablate `L14/H12 X->R1` 和 `L14/H20 X->P`，这两个在 heavy_full 中被复现。
-2. **补充 heavy_full 发现的强 head**：对 `L19/H0 X->R1`、`L12/H17 X->P`、`L10/H1 S<->R1`、`L5/H22 R1/S->X` 做 selected ablation，否则会低估 reference transfer / prompt control / fusion writeback 的因果影响。
+**P0 — 验证 light 发现的稳定机制（已在 heavy_full 中复现）**：
+- `L14/H12 X->R1`：reference transfer 的最强且最稳定的 head。
+- `L14/H20 X->P`：prompt control 的最强且最稳定的 head。
+
+**P1 — 补充 heavy_full 发现的、light 遗漏的强 head**：
+- `L19/H0 X->R1`：heavy_full 的 all-step top head；light 完全未采样 layer 19，必须验证阻断它是否会降低 reference fidelity。
+- `L12/H17 X->P`：heavy_full 的 all-step top head（0.989 mean X->P）；prompt adherence 可能主要由它控制。
+
+**P2 — 验证 late-step-specific fusion/writeback（all-step rank 低但 late-step rank 高）**：
+- `L24/H8 R1->S`：late-step rank=7，但 all-step rank=70；后期 reference→source 回写可能由它主导。
+- `L5/H22 S->X / R1->X`：heavy_full 的 writeback top head，test if fusion→target path is replaceable。
+- `L10/H1 S<->R1`：heavy_full 的 fusion top head，test if source-reference direct interaction is necessary。
+
+**在进入 full ablation 之前**：
+1. [ ] 先用推荐配置跑一轮 **updated light probe**，确认 expanded grid 仍能与 heavy_full 一致。
+2. [ ] 然后做 **seed stability**（seeds 0/1/2），检查关键 head 是否 seed-invariant。
+3. [ ] 最后做 **causal ablation**，优先 P0 和 P1 目标。

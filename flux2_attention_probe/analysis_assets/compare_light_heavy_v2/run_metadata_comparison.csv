@@ -8,7 +8,12 @@ effective_run,"{""first_image_size"": [2048, 3072], ""height_in"": null, ""heigh
 sample_layers,"[0, 4, 14, 24]",all,diff,
 sample_heads,"[0, 4, 8, 12, 16, 20]",all,diff,
 sample_steps,"[0, 14, 27]",all,diff,
+block_size,256,256,ok,
 segment_lengths,"{""P"": 512, ""R1"": 4056, ""S"": 4056, ""X"": 4056}","{""P"": 512, ""R1"": 4056, ""S"": 4056, ""X"": 4056}",ok,
+q_len,12621,12680,warning,q_len mismatch may indicate max_query_tokens_per_record config drift
+k_len,12680,12680,ok,
+num_q_blocks,50,50,ok,
+num_k_blocks,50,50,ok,
 light.attention_blocks_exists,True,True,ok,
 light.num_flow_rows_gt0,True,True,ok,
 light.num_distribution_rows_gt0,True,True,ok,
