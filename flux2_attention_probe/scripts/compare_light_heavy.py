@@ -98,6 +98,13 @@ def main() -> int:
     write_csv(output_dir / "sampling_bias_summary.csv", bias["rows"])
 
     plot_heavy_full(heavy_full_edge, heavy_rows, fig_dir)
+    plot_segment_flow_by_step(heavy_full_edge, fig_dir)
+    plot_cross_edges_by_step(heavy_full_edge, fig_dir)
+    plot_all_edges_by_layer(heavy_full_edge, fig_dir)
+    sparse_heads = compute_sparse_heads(heavy_rows)
+    write_csv(output_dir / "sparse_heads_top20.csv", sparse_heads[:20])
+    plot_sparse_concentration(sparse_heads, fig_dir)
+    plot_entropy_by_layer_head(heavy_rows, fig_dir)
     report = build_report(
         light_dir=light_dir,
         heavy_dir=heavy_dir,
@@ -599,6 +606,169 @@ def recommend_sampling(rows: list[dict]) -> dict:
     }
 
 
+
+
+def plot_segment_flow_by_step(edge_rows: dict, fig_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    edges = ["X->S", "X->R1", "X->P", "S->R1", "R1->S", "S->X", "R1->X", "X->X", "S->S", "R1->R1", "P->P"]
+    fig, axes = plt.subplots(3, 4, figsize=(16, 10))
+    axes = axes.flatten()
+    for idx, edge in enumerate(edges):
+        by_step = means_by(edge_rows, edge, "step")
+        xs = sorted(by_step)
+        ys = [by_step[x] for x in xs]
+        ax = axes[idx]
+        ax.plot(xs, ys, marker="o", linewidth=1.5)
+        ax.set_title(f"{edge} by step")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Attention mass")
+        ax.grid(True, alpha=0.3)
+    axes[-1].axis("off")
+    fig.suptitle("All segment-pair edges by denoising step (heavy full)")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "all_edges_by_step_full.png", dpi=160)
+    plt.close(fig)
+
+
+def plot_cross_edges_by_step(edge_rows: dict, fig_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    edges = ["X->S", "X->R1", "X->P", "S->R1", "R1->S", "S->X", "R1->X"]
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    for edge in edges:
+        by_step = means_by(edge_rows, edge, "step")
+        xs = sorted(by_step)
+        ax.plot(xs, [by_step[x] for x in xs], marker="o", label=edge, linewidth=1.5)
+    ax.set_xlabel("Denoising step index")
+    ax.set_ylabel("Attention mass")
+    ax.set_title("Cross-segment edges by step (heavy full)")
+    ax.legend(ncol=2, fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "cross_edges_by_step_full.png", dpi=160)
+    plt.close(fig)
+
+
+def plot_all_edges_by_layer(edge_rows: dict, fig_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    edges = ["X->S", "X->R1", "X->P", "S->R1", "R1->S", "S->X", "R1->X", "X->X", "S->S", "R1->R1", "P->P"]
+    fig, axes = plt.subplots(3, 4, figsize=(16, 10))
+    axes = axes.flatten()
+    for idx, edge in enumerate(edges):
+        by_layer = means_by(edge_rows, edge, "layer")
+        xs = sorted(by_layer)
+        ys = [by_layer[x] for x in xs]
+        ax = axes[idx]
+        ax.plot(xs, ys, marker="o", linewidth=1.5)
+        ax.set_title(f"{edge} by layer")
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Attention mass")
+        ax.grid(True, alpha=0.3)
+    axes[-1].axis("off")
+    fig.suptitle("All segment-pair edges by layer (heavy full)")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "all_edges_by_layer_full.png", dpi=160)
+    plt.close(fig)
+
+
+def compute_sparse_heads(heavy_rows: list[dict]) -> list[dict]:
+    acc = defaultdict(list)
+    for r in heavy_rows:
+        acc[(r["step"], r["layer"], r["head"])].append(r)
+    out = []
+    for (step, layer, head), vals in acc.items():
+        ent = mean(v["entropy"] for v in vals)
+        gini_proxy = mean(v["top16_block_mass"] for v in vals)
+        # Find dominant edge for this head
+        max_edge = max(vals, key=lambda x: x["value"])
+        out.append({
+            "step": step, "layer": layer, "head": head,
+            "mean_entropy": ent,
+            "mean_top16_block_mass": gini_proxy,
+            "dominant_edge": max_edge["edge"],
+            "dominant_edge_value": max_edge["value"],
+        })
+    out.sort(key=lambda x: x["mean_entropy"])
+    return out
+
+
+def plot_sparse_concentration(sparse_heads: list[dict], fig_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    top20 = sparse_heads[:20]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    
+    # Left: top20 sparse heads colored by dominant edge
+    edges = sorted({h["dominant_edge"] for h in top20})
+    edge_colors = {e: plt.cm.tab10(i % 10) for i, e in enumerate(edges)}
+    ax = axes[0]
+    for h in top20:
+        ax.scatter(h["mean_entropy"], h["mean_top16_block_mass"], 
+                   c=[edge_colors[h["dominant_edge"]]], s=80, alpha=0.8,
+                   edgecolors='black', linewidths=0.5)
+    ax.set_xlabel("Mean normalized entropy (lower = sparser)")
+    ax.set_ylabel("Mean top-16 block mass (higher = more concentrated)")
+    ax.set_title("Top 20 sparsest heads colored by dominant edge")
+    ax.grid(True, alpha=0.3)
+    # Manual legend
+    from matplotlib.lines import Line2D
+    legend_elements = [Line2D([0], [0], marker='o', color='w', markerfacecolor=edge_colors[e], 
+                               markersize=8, label=e) for e in edges]
+    ax.legend(handles=legend_elements, ncol=2, fontsize=7, loc='upper left')
+    
+    # Right: bar chart of dominant edge distribution in top20
+    ax = axes[1]
+    counts = {e: sum(1 for h in top20 if h["dominant_edge"] == e) for e in edges}
+    bars = ax.barh(list(counts.keys()), list(counts.values()), color=[edge_colors[e] for e in counts.keys()])
+    ax.set_xlabel("Count in top-20 sparsest heads")
+    ax.set_title("Which edges dominate the sparsest heads?")
+    ax.grid(True, alpha=0.3, axis='x')
+    fig.tight_layout()
+    fig.savefig(fig_dir / "sparse_concentration.png", dpi=160)
+    plt.close(fig)
+
+
+def plot_entropy_by_layer_head(heavy_rows: list[dict], fig_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    
+    # Aggregate entropy by (layer, head) across all steps
+    acc = defaultdict(list)
+    for r in heavy_rows:
+        if r["edge"] == "X->R1":
+            acc[(r["layer"], r["head"])].append(r["entropy"])
+    pairs = sorted(acc.keys())
+    ent_vals = [mean(acc[p]) for p in pairs]
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = range(len(pairs))
+    colors = [plt.cm.viridis((e - min(ent_vals)) / (max(ent_vals) - min(ent_vals) + 1e-12)) for e in ent_vals]
+    ax.bar(x, ent_vals, color=colors, width=0.8)
+    tick_idx = list(range(0, len(pairs), 24))
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels([f"L{pairs[i][0]}/H{pairs[i][1]}" for i in tick_idx], rotation=45, ha='right')
+    ax.set_xlabel("Layer/Head (sorted by layer, then head)")
+    ax.set_ylabel("Mean normalized entropy (X->R1)")
+    ax.set_title("Sparsity per (layer, head) averaged over all steps")
+    ax.axhline(y=mean(ent_vals), color='red', linestyle='--', label=f"global mean={mean(ent_vals):.3f}")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(fig_dir / "entropy_by_layer_head_full.png", dpi=160)
+    plt.close(fig)
+
+
 def plot_heavy_full(heavy_full: dict, heavy_rows: list[dict], fig_dir: Path) -> None:
     import matplotlib
 
@@ -994,6 +1164,141 @@ def build_report(**kwargs) -> str:
 | Fusion 最强在 L10/L24 | `L10/H1`=0.777 | Light 未采样 L10 |
 | Layer 4 最稀疏 | entropy=0.20 | Light 正确发现 |
 | Step 0-5 source preservation | X→S > X→R1 | Light 正确发现 |
+
+---
+
+### 2.10 按 Step 的完整 Segment Flow 分析
+
+以上分析是按单个 edge 看的。现在我们系统化地从 **timestep 维度**看所有 segment pairs 的完整演化。
+
+![heavy all edges by step](figures/all_edges_by_step_full.png)
+
+**图 14：All Segment-Pair Edges by Step（Heavy Full）**
+
+共 11 张子图，每张是一个 edge（X→S, X→R1, X→P, S→R1, R1→S, S→X, R1→X, X→X, S→S, R1→R1, P→P）随 28 个 denoising steps 的变化曲线。
+
+**系统化观察**：
+1. **自段注意（X→X, S→S, R1→R1, P→P）**：
+   - `X→X` 从 step0 的 ~0.62 逐渐上升到 step27 的 ~0.68`，target 自保持随 denoising 增强。
+   - `R1→R1` 稳定在 ~0.55-0.60，reference 自保持较稳定。
+   - `P→P` 从 ~0.55 下降到 ~0.45，prompt tokens 逐渐将注意力分散到其他 segments。
+
+2. **Cross-segment 动态（合并图）**：
+
+![heavy cross edges by step](figures/cross_edges_by_step_full.png)
+
+**图 15：Cross-Segment Edges by Step（合并展示）**
+
+- **X→R1**：step 0-15 维持 0.10-0.12，step 20 后下降至 ~0.065。
+- **X→P**：step 0 最高（~0.28），随后稳定在 0.27，step 25-27 略有回升。
+- **X→S**：step 0 最高（~0.12），快速下降至 ~0.07，confirm source preservation 偏早期。
+- **S→R1 / R1→S**：step 0-15 缓慢上升，step 20-27 加速上升至 ~0.14，说明 source↔reference 融合在 late stage 增强。
+- **S→X / R1→X**：step 0-10 中等（0.13-0.16），step 15-27 持续上升至 ~0.22，说明 conditioning→target 回写在后期主导。
+
+3. **时序分工总结**：
+   - **Early（0-5）**：prompt 注入（X→P 高）、source preservation（X→S 高）、target 自保持建立。
+   - **Mid（10-15）**：reference transfer 峰值（X→R1）、prompt 持续约束。
+   - **Late（20-27）**：reference transfer 减弱，转为 fusion（S↔R1）和 writeback（S→X, R1→X）主导，prompt 约束最后回升。
+
+### 2.11 按 Layer 的完整 Segment Flow 分析
+
+现在从 **layer 维度**看所有 segment pairs 的分布。
+
+![heavy all edges by layer](figures/all_edges_by_layer_full.png)
+
+**图 16：All Segment-Pair Edges by Layer（Heavy Full）**
+
+共 11 张子图，每张是一个 edge 随 25 个 layers 的变化曲线。
+
+**系统化观察**：
+1. **X→R1 的 layer 分布**：
+   - Layer 0-3（double-stream）：几乎为 0（<0.02）。
+   - Layer 4：跳升至 ~0.14（light 发现的 `L4/H4`）。
+   - Layer 5-12：维持在 0.08-0.12。
+   - **Layer 14-20：达到峰值 0.15-0.24**（light missed 的区域）。
+   - Layer 21-24：下降至 ~0.01。
+
+2. **X→P 的 layer 分布**：
+   - Layer 0-4：中等（0.05-0.10）。
+   - **Layer 9-10：跳升至 ~0.60**（light missed 的绝对高值区）。
+   - Layer 14-15：次高峰 ~0.35（light 的 `L14/H20` 所在区）。
+   - Layer 24：~0.29（late prompt control）。
+
+3. **S→X / R1→X（writeback）的 layer 分布**：
+   - **Layer 5：R1→X 达到 ~0.22**（light missed 的早期 writeback 峰值）。
+   - Layer 9-15：中等（0.10-0.15）。
+   - **Layer 23-24：飙升至 ~0.53**（light 发现的 late writeback）。
+   - 结论：writeback 有两个波峰——early（L5）和 late（L23-24）。
+
+4. **S→R1 / R1→S（fusion）的 layer 分布**：
+   - Layer 0-8：较弱（<0.10）。
+   - **Layer 10：跳升至 ~0.12**（light missed 的中间融合峰）。
+   - Layer 14-22：缓慢上升。
+   - **Layer 24：达到 ~0.20**（light 发现的 late fusion）。
+
+### 2.12 稀疏性系统化分析
+
+以上分析了 attention mass 的分布，现在系统化地分析 **稀疏性**按 head、layer、step 的分解，以及稀疏集中在哪些 segment pair 上。
+
+#### 2.12.1 最稀疏的 Head 及其主导 Edge
+
+我们从全量 600 个 (layer, head) × 28 steps = 16800 条记录中，按 **normalized entropy** 排序，找出最稀疏的 20 个 head。
+
+![heavy sparse concentration](figures/sparse_concentration.png)
+
+**图 17：Sparse Concentration Analysis（Heavy）**
+
+- **左图**：横轴 entropy（越低越稀疏），纵轴 top-16 block mass（越高越集中），每个点是一个 (layer, head, step)，颜色代表该 head 的 **dominant edge**（value 最高的 edge）。
+- **右图**：top-20 最稀疏 head 的 dominant edge 分布计数。
+
+**关键发现**：
+1. **最稀疏的 head 大多 dominated by 自段注意**：`X→X`、`R1→R1`、`S→S` 在 top-20 稀疏 head 中占多数。这说明稀疏性主要来自"只关注自身 token"的 head。
+2. **但有几个 cross-segment head 也非常稀疏**：
+   - `L4/H4`（X→R1 dominant, entropy~0.25）：reference transfer 可以极度集中。
+   - `L14/H20`（X→P dominant, entropy~0.30）：prompt control 也可以极度集中。
+   - `L5/H22`（R1→X dominant, entropy~0.35）：writeback 也可以高度集中。
+3. **稀疏 ≠ 不重要**：top-20 中最稀疏的几个 cross-segment head 恰恰是 heavy_full 中排名最高的功能 head。这说明稀疏性是 sparse routing 的 favorable signal，但需要结合具体 edge 判断。
+
+#### 2.12.2 稀疏性按 Layer×Head 分解
+
+![heavy entropy by layer head](figures/entropy_by_layer_head_full.png)
+
+**图 18：Entropy per (Layer, Head) Averaged over All Steps（Heavy）**
+
+- **横轴**：600 个 (layer, head) 组合，按 layer 排序
+- **纵轴**：mean normalized entropy（越低越稀疏）
+- **红线**：全局平均值
+
+**关键发现**：
+1. **Layer 0-4（double-stream）**：entropy 分布较分散，既有极低值（<0.25）也有高值（>0.70）。说明 double-stream 的 head 异质性最强——有的极度稀疏，有的非常分散。
+2. **Layer 5-12（single-stream 早期）**：entropy 整体较低，但 L5 和 L10 有几个明显低谷（<0.30），对应强 writeback 和 fusion head。
+3. **Layer 14-20（single-stream 中期）**：entropy 波动较大，L14 和 L16 有低谷，对应 reference transfer 和 prompt control head。
+4. **Layer 21-24（single-stream 后期）**：entropy 整体较高（>0.55），说明 late-layer 的 attention 更分散，全局融合性质更强。
+
+#### 2.12.3 稀疏性按 Step 分解（回顾图 13）
+
+从图 13（entropy_gini_by_layer_step.png）可以补充 step 维度的观察：
+1. **Step 0**：layer 0-4 的 entropy 最低，说明 early denoising 的 double-stream attention 最集中。
+2. **Step 14-20**：layer 14-20 出现局部 entropy 低谷，说明中期 reference transfer 和 prompt control 阶段有集中化趋势。
+3. **Step 27**：layer 23-24 的 top-16 mass 显著升高，说明最后一步的 writeback 是高度集中的，但 entropy 不低（~0.60），说明集中区域较宽而非单一 peak。
+
+#### 2.12.4 稀疏集中区域总结
+
+| 稀疏区域 | 位置 | 主导 Edge | 机制含义 |
+|---|---|---|---|
+| 最稀疏 | L4/H4, step 0-14 | X→R1 | Reference transfer 高度集中 |
+| 次稀疏 | L14/H20, step 14-27 | X→P | Prompt control 高度集中 |
+| 第三稀疏 | L5/H22, step 5-15 | R1→X | Early writeback 高度集中 |
+| 第四稀疏 | L10/H1, step 10-20 | S→R1 | Mid fusion 高度集中 |
+| 全局稀疏 | L0-4 多数 head | X→X / R1→R1 | 自段注意天然集中 |
+| 全局分散 | L21-24 多数 head | 多 edge 混合 | Late fusion 需要宽视野 |
+
+**结论**：稀疏性不是均匀分布的。它集中在：
+1. **Double-stream 早期**（layer 0-4）的自段注意 head；
+2. **Single-stream 中期的特定功能 head**（L4/H4 的 X→R1, L14/H20 的 X→P, L5/H22 的 R1→X）；
+3. **Late layer（L21-24）整体较分散**，不适合 sparse routing。
+
+这为后续的 sparse attention 设计提供了明确信号：**优先保留 double-stream 和 single-stream 中期的稀疏功能 head，late layer 保持全连接或粗粒度稀疏**。
 
 ---
 
