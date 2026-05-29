@@ -2,12 +2,13 @@
 
 > 版本：2026-05-29  
 > 分支：`codex/flux2-attention-probe`  
-> 目的：把现有 full-attention teacher 数据重新整理成一份中文、分层、可执行的系统分析报告，并补充“任务 / prompt / 分辨率 / 输入图数量”变化下的下一步机制验证计划。  
-> 当前结论范围：仅覆盖 **single source + single reference**、seed=0、1248×832、28-step、prompt=`Change the background of the first image to that of the second image.` 的 FLUX.2-klein-4B 推理样本。本文会明确区分：
+> 目的：把现有 full-attention teacher 数据整理成一份中文、分层、可复现、可执行的系统分析报告，并补充“任务 / prompt / 分辨率 / 输入图数量”变化下的下一步机制验证计划。  
+> 当前结论范围：仅覆盖 **single source + single reference**、seed=0、1248×832、28-step、prompt=`Change the background of the first image to that of the second image.` 的 FLUX.2-klein-4B 推理样本。本文明确区分：
 >
 > 1. 当前背景替换任务下已经被数据支持的结论；
 > 2. 可能跨任务稳定的普适机制假设；
-> 3. 需要下一轮实验验证的开放问题。
+> 3. 需要下一轮实验验证的开放问题；
+> 4. 每份数据/表/图对应的生成命令与输出目录。
 
 ---
 
@@ -31,17 +32,9 @@ Change the background of the first image to that of the second image.
 Change the background of the second image to that of the first image.
 ```
 
-或者任务变成：
+或者任务变成参考打光、添加/删除物体、修改衣服、添加饰品、多参考图分别提供身份/服装/背景/光照，那么 `X->R1`、`X->S`、`X->P`、`S<->R1`、`R1->X` 的强度、位置、时间窗口和 top heads 都可能变化。
 
-- 参考打光；
-- 添加 / 删除物体；
-- 修改衣服；
-- 添加饰品；
-- 多参考图分别提供身份、服装、背景、光照；
-
-那么 `X->R1`、`X->S`、`X->P`、`S<->R1`、`R1->X` 的强度、位置、时间窗口和 top heads 都可能变化。
-
-本报告的正确目标应该是：
+本报告的正确目标是：
 
 > 从当前背景替换样本中抽取机制候选，然后设计一组任务变化实验，区分“背景替换特异性模式”和“跨任务稳定的推理机制骨架”。
 
@@ -49,17 +42,18 @@ Change the background of the second image to that of the first image.
 
 ## 1. 原报告为什么不够系统
 
-原有报告中有很多有效结论，但组织方式不够系统，主要问题有五个：
+原有报告中有很多有效结论，但组织方式不够系统，主要问题有六个：
 
 1. **任务特异性没有被充分标注**：当前 prompt 是背景替换，并且带明确 first/second image 角色绑定。报告里虽然描述了 source/ref，但没有把“背景替换”作为解释所有 attention 现象的前提。
 2. **语义角色与物理 segment 混在一起**：`S`、`R1` 是输入槽位；但在不同 prompt 下，谁是 target content carrier、谁是 attribute donor 可能会变化。
 3. **light run 与 heavy run 的角色没有被清楚分离**：light 是 scout，用来定位候选机制；heavy 是 full teacher，用来校准 light 偏差并生成 atlas。两者不能直接平均值对比，必须先做 heavy slice。
 4. **“稀疏”这个词有歧义**：当前 block size=256，本质是 1D strip-level block sparsity，不是真正 object/region-level 的 2D 空间稀疏。
 5. **策略结论和统计标签有潜在冲突**：atlas 里大量 `X->X` / `S->S` / `R1->R1` 因为 segment dominance 被标成 SPARSE，但这不等价于第一阶段工程实现里就应该裁掉自注意力。
+6. **缺少可复现命令链**：读者看到 `priority0_systematic`、`compare_light_heavy_v2`、`priority0_sparse_atlas` 的结果，但不知道它们分别由哪些命令生成。
 
 因此本文按如下顺序重构：
 
-**数据与符号 → 当前背景替换机制 → 任务特异性 → 普适机制假设 → 泛化实验矩阵 → 稀疏策略 → 机制验证计划。**
+**数据与符号 → 数据生成命令 → 当前背景替换机制 → 任务特异性 → 普适机制假设 → 泛化实验矩阵 → 稀疏策略 → 机制验证计划。**
 
 ---
 
@@ -122,16 +116,253 @@ Change the background of the second image to that of the first image.
 1. **物理 edge**：`X->S`, `X->R1`, `S->R1`；
 2. **语义 edge**：`X->T`, `X->D_bg`, `X->D_light`, `X->D_cloth`, `X->R_wrong`。
 
-只有这样才能回答：
-
-- 模型是否学到“背景 donor”这个语义角色；
-- 还是只偏向某个输入槽位，比如总是偏向 `R1` 或总是偏向 `S`。
+只有这样才能回答：模型是否学到“背景 donor”这个语义角色，还是只偏向某个输入槽位，比如总是偏向 `R1` 或总是偏向 `S`。
 
 ---
 
-## 3. 当前背景替换任务下的已验证结论
+## 3. 数据生成与后处理命令
 
-### 3.1 全局信息流
+> 这一节用于保证报告可复现。所有命令都假设从 `flux2_attention_probe/` 目录执行。实际 source/ref 图片路径没有提交到仓库，因此用环境变量占位。
+
+### 3.1 通用环境变量
+
+```bash
+cd /home/ag/projects_anguo/diffusers/flux2_attention_probe
+
+export SOURCE=/path/to/first_image.png
+export REF1=/path/to/second_image.png
+export PROMPT="Change the background of the first image to that of the second image."
+
+export ASCEND_VISIBLE_DEVICES=2
+export PYTHONPATH=$PWD/../src
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+```
+
+### 3.2 Light_new 机制探针数据
+
+用途：快速 scout，采样少量 layer/head/step，验证 hook 与机制方向。
+
+输入配置：
+
+```yaml
+config: configs/probe_mechanism_light.yaml
+sample_layers: [0, 4, 14, 24]
+sample_heads: [0, 4, 8, 12, 16, 20]
+sample_steps: [0, 14, 27]
+block_size: 256
+max_query_tokens_per_record: 12621  # 旧配置，下一轮应改成 all
+```
+
+运行命令：
+
+```bash
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism_light.yaml \
+  --source "$SOURCE" \
+  --refs "$REF1" \
+  --prompt "$PROMPT" \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new
+```
+
+汇总命令：
+
+```bash
+python3 scripts/summarize_probe.py \
+  --input_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new \
+  --config configs/probe_mechanism_light.yaml
+```
+
+主要输出：
+
+```text
+/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new/
+  attention_blocks.jsonl
+  attention_records.jsonl
+  segment_flow_by_step_layer_head.parquet
+  distribution_metrics.parquet
+  segment_map.json
+  probe_registration.json
+  metrics_report.json
+  figures/
+```
+
+注意：`light_new` 沿用了旧的 `max_query_tokens_per_record=12621`，而当前 1248×832 输入实际 token 总长为 12680。由于 `block_size=256` 下二者都对应 50 个 query blocks，因此 segment-level 结论基本不受影响；下一轮 light 必须改为 `max_query_tokens_per_record: all`。
+
+### 3.3 Heavy_v2 full-attention teacher 数据
+
+用途：主证据。覆盖所有 attention layers、所有 heads、所有 denoising steps，但只保存 block-level summary，不保存 full `N×N` attention tensor。
+
+输入配置：
+
+```yaml
+config: configs/probe_mechanism_heavy.yaml
+sample_layers: all
+sample_heads: all
+sample_steps: all
+block_size: 256
+max_query_tokens_per_record: all
+save_full_attention: false
+save_block_attention: true
+```
+
+运行命令：
+
+```bash
+python3 scripts/run_probe.py \
+  --config configs/probe_mechanism_heavy.yaml \
+  --source "$SOURCE" \
+  --refs "$REF1" \
+  --prompt "$PROMPT" \
+  --num_inference_steps 28 \
+  --seed 0 \
+  --backend npu \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy
+```
+
+汇总命令：
+
+```bash
+python3 scripts/summarize_probe.py \
+  --input_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy \
+  --config configs/probe_mechanism_heavy.yaml
+```
+
+主要输出：
+
+```text
+/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy/
+  attention_blocks.jsonl
+  attention_records.jsonl
+  attention_shapes.jsonl
+  attention_summary.parquet
+  segment_flow_by_step_layer_head.parquet
+  distribution_metrics.parquet
+  segment_map.json
+  effective_run.json
+  probe_registration.json
+  metrics_report.json
+  figures/
+```
+
+### 3.4 Light vs Heavy 对比数据
+
+用途：先从 heavy 中切出和 light 完全相同的 layer/head/step 子集，验证 light 统计是否可靠；再用 heavy full 分析 light 采样偏差。
+
+运行命令：
+
+```bash
+python3 scripts/compare_light_heavy.py \
+  --light_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new \
+  --heavy_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy/compare_light_heavy_v2
+```
+
+主要输出：
+
+```text
+/home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy/compare_light_heavy_v2/
+  compare_light_heavy_v2_report.md
+  run_metadata_comparison.csv
+  light_vs_heavy_slice_edge_metrics.csv
+  light_vs_heavy_slice_edge_diff.csv
+  key_mechanism_replication.csv
+  sampling_bias_summary.csv
+  heavy_full_edge_summary.csv
+  heavy_full_top_layer_head.csv
+  sparse_heads_top20.csv
+  figures/
+```
+
+仓库内复制/保存路径：
+
+```text
+flux2_attention_probe/analysis_assets/compare_light_heavy_v2/
+flux2_attention_probe/data/mechanism_single_ref_heavy/compare_light_heavy_v2/
+```
+
+### 3.5 Priority0 systematic anatomy 数据
+
+用途：把 heavy_v2 的 full block-level attention 进一步整理成系统解剖报告，包括 step/layer/head/edge、空间 block matrix、spatial overlay、sparsity distribution 等。
+
+当前仓库中已经提交了输出：
+
+```text
+flux2_attention_probe/reports/priority0_systematic_report.md
+flux2_attention_probe/data/priority0_systematic/
+```
+
+但需要诚实说明：**当前提交中没有找到完整、独立、可直接复现 `priority0_systematic` 目录的生成脚本/命令。** 该目录显然来自 heavy_v2 的 `attention_blocks.jsonl` 与相关后处理，但精确命令需要补录。后续应把这一步固定成脚本，例如：
+
+```bash
+# TODO: 将当前 priority0_systematic 的临时后处理整理成正式脚本
+python3 scripts/build_priority0_systematic.py \
+  --heavy_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy \
+  --light_dir /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light_new \
+  --output_dir /home/ag/projects_anguo/results/attention_i2i/priority0_systematic
+```
+
+在补齐脚本前，本报告引用 `priority0_systematic` 时应视为 **已生成分析产物**，但不能视为完全可复现步骤。
+
+### 3.6 Sparse atlas 数据
+
+用途：把 heavy_v2 / systematic outputs 转成 sparse / dense / fallback 决策表。
+
+当前脚本 `scripts/build_sparse_atlas.py` 使用硬编码路径：
+
+```python
+HEAVY_DIR = /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_heavy
+SYSTEMATIC_DIR = /home/ag/projects_anguo/results/attention_i2i/priority0_systematic
+LIGHT_DIR = /home/ag/projects_anguo/results/attention_i2i/mechanism_single_ref_light
+OUT_DIR = /home/ag/projects_anguo/results/attention_i2i/priority0_sparse_atlas
+```
+
+运行命令：
+
+```bash
+python3 scripts/build_sparse_atlas.py
+```
+
+主要输出：
+
+```text
+/home/ag/projects_anguo/results/attention_i2i/priority0_sparse_atlas/
+  atlas_report.md
+  atlas_decision_table.csv
+  sparse_candidate_edges.csv
+  dense_required_edges.csv
+  fallback_required_edges.csv
+  density_sweep.csv
+  rerun_requirements.md
+  figures/
+```
+
+仓库内复制/保存路径：
+
+```text
+flux2_attention_probe/reports/priority0_sparse_atlas_report.md
+flux2_attention_probe/data/priority0_sparse_atlas/
+```
+
+### 3.7 复现状态表
+
+| 数据/报告 | 生成命令状态 | 备注 |
+|---|---|---|
+| `mechanism_single_ref_light_new` | 已记录 | `run_probe.py + probe_mechanism_light.yaml` |
+| `mechanism_single_ref_heavy` | 已记录 | `run_probe.py + probe_mechanism_heavy.yaml` |
+| `compare_light_heavy_v2` | 已记录 | `compare_light_heavy.py` |
+| `priority0_systematic` | **待补录** | 输出已提交，但生成脚本/命令未完整提交 |
+| `priority0_sparse_atlas` | 已记录 | `build_sparse_atlas.py`，但脚本当前使用硬编码路径，建议改成 CLI 参数 |
+
+---
+
+## 4. 当前背景替换任务下的已验证结论
+
+### 4.1 全局信息流
 
 Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是少数功能 head 的专门行为。
 
@@ -156,7 +387,7 @@ Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是
 3. `R1->X` / `S->X` 说明 target 不只主动读取条件图；conditioning tokens 也参与向 target 的 writeback 路径。
 4. `S<->R1` 说明 source 和 background reference 会直接融合。多 reference 场景下，这可能演化成 reference contamination。
 
-### 3.2 当前任务的阶段分工
+### 4.2 当前任务的阶段分工
 
 #### Early：step 0–5
 
@@ -190,7 +421,7 @@ Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是
 
 背景替换解释：late stage 不再大量 direct target-to-reference，而是转向 background/source 融合后回写 target。
 
-### 3.3 当前任务下的关键机制 head
+### 4.3 当前任务下的关键机制 head
 
 | 机制 | Edge | Head | 证据摘要 | 当前解释 |
 |---|---|---|---|---|
@@ -205,9 +436,9 @@ Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是
 
 ---
 
-## 4. 哪些是背景替换特异性，哪些可能更普适
+## 5. 哪些是背景替换特异性，哪些可能更普适
 
-### 4.1 背景替换特异性模式
+### 5.1 背景替换特异性模式
 
 以下结论很可能依赖当前 prompt 和任务：
 
@@ -216,7 +447,7 @@ Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是
 3. **`S<->R1` fusion 可能与背景融合有关**：背景替换需要把 source foreground 与 reference background 边界融合，因此 fusion/writeback 明显。删除物体或纯打光任务可能出现不同 fusion 模式。
 4. **`X->P` 的高值可能部分来自 first/second 角色绑定**：当前 prompt 明确说 first image / second image。若 prompt 改成更隐式的表达，`X->P` 可能增强或削弱。
 
-### 4.2 可能跨任务稳定的普适机制骨架
+### 5.2 可能跨任务稳定的普适机制骨架
 
 以下是假设，不是已经完全证明的定律。它们需要下一轮实验验证：
 
@@ -233,11 +464,11 @@ Heavy full 的全局平均说明，自段注意仍然是主体，跨段注意是
 
 ---
 
-## 5. 不同任务下的 attention 预期变化
+## 6. 不同任务下的 attention 预期变化
 
 下面是基于当前数据提出的 **可检验预测**。这些不是结论，而是下一轮实验的 hypothesis。
 
-### 5.1 反向背景替换
+### 6.1 反向背景替换
 
 Prompt：
 
@@ -257,15 +488,9 @@ Change the background of the second image to that of the first image.
 - `X->P` 可能更高，因为 prompt 需要覆盖 pipeline 默认的 source/ref 先验；
 - 若模型强依赖输入槽位，则即使 prompt 反转，attention 仍可能偏向原 `R1`。
 
-需要报告：
+### 6.2 参考打光 / 光照迁移
 
-- physical edge：`X->S`, `X->R1`；
-- semantic edge：`X->T`, `X->D_bg`；
-- role binding failure cases：输出是否把错误图片当成 target。
-
-### 5.2 参考打光 / 光照迁移
-
-任务例子：
+Prompt 示例：
 
 ```text
 Change the lighting of the first image to match the second image.
@@ -280,9 +505,9 @@ Change the lighting of the first image to match the second image.
 
 稀疏含义：光照任务不一定适合超低密度 sparse mask，可能需要更高密度或 fallback。
 
-### 5.3 衣服 / 饰品参考
+### 6.3 衣服 / 饰品参考
 
-任务例子：
+Prompt 示例：
 
 ```text
 Change the clothes of the person in the first image to match the second image.
@@ -299,9 +524,9 @@ Add the glasses from the second image to the person in the first image.
 
 稀疏含义：衣服/饰品可能比背景和光照更适合 region-level sparse，但当前 1D block resolution 不够。
 
-### 5.4 添加物体
+### 6.4 添加物体
 
-任务例子：
+Prompt 示例：
 
 ```text
 Add the object from the second image into the first image.
@@ -315,11 +540,9 @@ Add the object from the second image into the first image.
 - `D_obj->X` late writeback 应强；
 - 如果没有显式位置描述，attention 可能更 diffuse。
 
-稀疏含义：需要把 object region localization 和 prompt position binding 一起验证。
+### 6.5 删除物体
 
-### 5.5 删除物体
-
-任务例子：
+Prompt 示例：
 
 ```text
 Remove the object from the first image.
@@ -333,11 +556,9 @@ Remove the object from the first image.
 - `X->X` 和 local inpainting-like self-attention 可能增强；
 - 若提供 reference background，则 `X->D_bg` / `D_bg->X` 会回升。
 
-稀疏含义：删除任务可能不能直接复用 background transfer 的 `X->R1` sparse mask。
+### 6.6 多参考图任务
 
-### 5.6 多参考图任务
-
-任务例子：
+Prompt 示例：
 
 ```text
 Use the identity from the first reference, clothes from the second reference, and background from the third reference.
@@ -354,9 +575,9 @@ Use the identity from the first reference, clothes from the second reference, an
 
 ---
 
-## 6. 下一轮实验矩阵
+## 7. 下一轮实验矩阵
 
-### 6.1 实验维度
+### 7.1 实验维度
 
 | 维度 | 水平 | 目的 |
 |---|---|---|
@@ -368,11 +589,9 @@ Use the identity from the first reference, clothes from the second reference, an
 | Tiling | 1D block256, 2D tile8×8 | 测试真实空间稀疏 |
 | Image pair | 同一图对正反向、不同图对重复 | 区分图像内容偏差与机制规律 |
 
-### 6.2 P0：背景替换 role symmetry 实验
+### 7.2 P0：背景替换 role symmetry 实验
 
 目标：验证当前结论到底是 background-transfer 机制，还是 source/ref slot bias。
-
-实验组：
 
 | 组 | 输入槽位 | Prompt | 目的 |
 |---|---|---|---|
@@ -388,11 +607,7 @@ Use the identity from the first reference, clothes from the second reference, an
 - 输出是否真的改变了正确图片的背景；
 - `X->P` 是否在 role conflict 情况下升高。
 
-### 6.3 P1：分辨率一致性实验
-
-目标：判断 segment-level 机制是否跨分辨率稳定。
-
-设置：
+### 7.3 P1：分辨率一致性实验
 
 ```yaml
 max_size: [512, 768, 1024]
@@ -401,23 +616,9 @@ task: background A->B
 max_query_tokens_per_record: all
 ```
 
-指标：
+指标：segment flow Pearson/Spearman、top head rank overlap、step curve correlation、tile/block top-k overlap、semantic edge stability。
 
-- segment flow Pearson/Spearman；
-- top head rank overlap；
-- step curve correlation；
-- tile/block top-k overlap；
-- semantic edge stability：`X->D_bg`, `D_bg->X`, `X->P`。
-
-预期：
-
-- segment-level mass 应相对稳定；
-- spatial block/tile top-k 会随分辨率变化；
-- 如果某个 sparse mask 只能在 1024 成立，不能直接认为可泛化。
-
-### 6.4 P2：任务类型泛化实验
-
-最小任务集合：
+### 7.4 P2：任务类型泛化实验
 
 | 任务 | Prompt 示例 | 重点 edge |
 |---|---|---|
@@ -438,9 +639,7 @@ probe: expanded_light
 
 对关键任务再跑 heavy / 2D tile。
 
-### 6.5 P3：多参考绑定实验
-
-目标：验证 role-aware routing 与 wrong-reference contamination。
+### 7.5 P3：多参考绑定实验
 
 推荐设置：
 
@@ -465,9 +664,9 @@ prompt: Use R1 for identity, R2 for clothing, R3 for background.
 
 ---
 
-## 7. 稀疏策略：从“当前 atlas”升级为“任务条件化 atlas”
+## 8. 稀疏策略：从“当前 atlas”升级为“任务条件化 atlas”
 
-### 7.1 当前 atlas 的正确解读
+### 8.1 当前 atlas 的正确解读
 
 当前 atlas 把每个 `(layer, head, edge)` 分成三类：
 
@@ -485,7 +684,7 @@ atlas(task, prompt_role, resolution, num_refs, seed)
 
 然后分析哪些 sparse decision 是稳定的，哪些只对某个任务成立。
 
-### 7.2 第一阶段不要做的事
+### 8.2 第一阶段不要做的事
 
 1. 不要直接把所有 `SPARSE` 标签上线为 kernel mask。
 2. 不要对 self-attention 做大范围裁剪。
@@ -493,7 +692,7 @@ atlas(task, prompt_role, resolution, num_refs, seed)
 4. 不要对 diffuse fusion head 做超低密度 sparse。
 5. 不要只看 all-step mean；late-specific head 会被低估。
 
-### 7.3 第一阶段可以做的事
+### 8.3 第一阶段可以做的事
 
 | 优先级 | Target | 当前任务下的依据 | 泛化验证要求 |
 |---|---|---|---|
@@ -507,7 +706,7 @@ atlas(task, prompt_role, resolution, num_refs, seed)
 
 ---
 
-## 8. 2D tile 是必要条件，不是可选优化
+## 9. 2D tile 是必要条件，不是可选优化
 
 当前 `block_size=256` 的问题非常大：
 
@@ -540,13 +739,13 @@ seeds: [0]
 
 ---
 
-## 9. 机制验证：从统计相关走向因果验证
+## 10. 机制验证：从统计相关走向因果验证
 
-### 9.1 Ablation 不能只在当前任务上做
+### 10.1 Ablation 不能只在当前任务上做
 
 如果只在当前背景替换 prompt 上 ablate `L14/H12 X->R1`，最多只能说明它对当前 background transfer 有影响。要证明机制更普适，需要跨任务验证。
 
-### 9.2 当前任务 ablation 分组
+### 10.2 当前任务 ablation 分组
 
 | 组 | 操作 | 要验证的问题 |
 |---|---|---|
@@ -558,7 +757,7 @@ seeds: [0]
 | F | block `L10/H1 S<->R1` | fusion 是否必要，是否影响背景融合边界 |
 | G | A+B+E 组合 | 同时切 direct transfer 与 writeback 后 reference 是否显著消失 |
 
-### 9.3 跨任务 ablation 分组
+### 10.3 跨任务 ablation 分组
 
 | 任务 | Ablation target | 预期影响 |
 |---|---|---|
@@ -570,7 +769,7 @@ seeds: [0]
 | 删除物体 | `X->P`, local `X->X`, `X->S` | 删除失败或 source preservation 变差 |
 | 多参考 | wrong-ref high heads | reference contamination 降低或正确绑定提升 |
 
-### 9.4 评价指标
+### 10.4 评价指标
 
 | 维度 | 指标 |
 |---|---|
@@ -585,11 +784,9 @@ seeds: [0]
 
 ---
 
-## 10. 建议的下一轮执行顺序
+## 11. 建议的下一轮执行顺序
 
 ### Step 1：先补背景替换 role symmetry
-
-目的：把当前结论从“一个 prompt 的发现”升级为“背景替换机制”。
 
 ```yaml
 tasks:
@@ -665,11 +862,11 @@ probe: expanded_light + selected heavy/tile
 
 ---
 
-## 11. 报告格式建议：以后每个任务都按同一模板输出
+## 12. 报告格式建议：以后每个任务都按同一模板输出
 
 每个新任务报告都应包含以下固定表格，避免再次变成零散观察。
 
-### 11.1 Metadata
+### 12.1 Metadata
 
 | 字段 | 值 |
 |---|---|
@@ -681,8 +878,10 @@ probe: expanded_light + selected heavy/tile
 | num_refs | |
 | segment map | |
 | probe config | |
+| run command | |
+| output dir | |
 
-### 11.2 Semantic role map
+### 12.2 Semantic role map
 
 | Physical segment | Semantic role | Expected contribution |
 |---|---|---|
@@ -690,29 +889,29 @@ probe: expanded_light + selected heavy/tile
 | R1 | D_bg / D_light / D_cloth / ... | |
 | R2 | ... | |
 
-### 11.3 Core flow table
+### 12.3 Core flow table
 
 | Edge type | Physical edge | Semantic edge | Mean | Early | Mid | Late | Interpretation |
 |---|---|---|---:|---:|---:|---:|---|
 
-### 11.4 Top heads
+### 12.4 Top heads
 
 | Mechanism | Semantic edge | Physical edge | Layer | Head | Mean | Peak step | Entropy | Tile concentration | Stable? |
 |---|---|---|---:|---:|---:|---:|---:|---:|---|
 
-### 11.5 Task-specific vs universal verdict
+### 12.5 Task-specific vs universal verdict
 
 | Observation | Task-specific? | Universal candidate? | Evidence | Next test |
 |---|---|---|---|---|
 
-### 11.6 Sparse decision
+### 12.6 Sparse decision
 
 | Candidate | Decision | Density | Fallback? | Why | Ablation needed? |
 |---|---|---:|---|---|---|
 
 ---
 
-## 12. 最终结论
+## 13. 最终结论
 
 当前数据支持的最稳妥结论是：
 
@@ -723,6 +922,7 @@ probe: expanded_light + selected heavy/tile
 5. **真正可泛化的结论应该写成 semantic-role-normalized 形式，例如 `X->D_bg`、`X->D_light`、`D_attr->X`，而不是只写 `X->R1`。**
 6. **Sparse routing 应从当前 atlas 升级为 task-conditioned / role-conditioned atlas。**
 7. **2D tile 是必要条件，因为当前 block size=256 只能提供粗粒度 strip-level sparsity。**
+8. **复现实验必须记录完整命令链；当前 light/heavy/compare/sparse-atlas 命令已补齐，`priority0_systematic` 的生成命令仍需把临时后处理固化成正式脚本。**
 
 一句话总结：
 
